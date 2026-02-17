@@ -10,6 +10,7 @@ import maplibregl from 'maplibre-gl'
 import { useTreeData } from '../composables/useTreeData'
 import { registerTreeIcons, CATEGORY_COLORS } from '../composables/useTreeCategories'
 import { useFlyTo } from '../composables/useFlyTo'
+import { useMapData } from '../composables/useMapData'
 import type { TreeCategory } from '../types'
 
 const mapContainer = ref<HTMLDivElement>()
@@ -17,6 +18,7 @@ let map: maplibregl.Map | null = null
 
 const { geojson, loading, error } = useTreeData()
 const { target: flyToTarget } = useFlyTo()
+const { currentGeoJSON, publishGeoJSON } = useMapData()
 
 function buildColorExpression(): maplibregl.ExpressionSpecification {
   const entries = Object.entries(CATEGORY_COLORS)
@@ -39,11 +41,11 @@ function buildIconExpression(): maplibregl.ExpressionSpecification {
 }
 
 function addTreeLayers() {
-  if (!map || !geojson.value) return
+  if (!map || !currentGeoJSON.value) return
 
   map.addSource('trees', {
     type: 'geojson',
-    data: geojson.value,
+    data: currentGeoJSON.value,
   })
 
   // Layer 1: Heatmap at far zoom
@@ -200,15 +202,28 @@ onMounted(() => {
 
   map.on('load', () => {
     registerTreeIcons(map!)
-    if (geojson.value) {
+    if (currentGeoJSON.value) {
       addTreeLayers()
     }
   })
 })
 
+// Seed shared map data when tree data first loads
+watch(geojson, (val) => {
+  if (val && !currentGeoJSON.value) {
+    publishGeoJSON(val)
+  }
+})
+
 // If data loads after map is ready
-watch(geojson, () => {
-  if (map?.loaded() && geojson.value && !map.getSource('trees')) {
+watch(currentGeoJSON, (newData) => {
+  if (!map?.loaded() || !newData) return
+  const source = map.getSource('trees') as maplibregl.GeoJSONSource | undefined
+  if (source) {
+    // Update existing source data (chat publish_results)
+    source.setData(newData)
+  } else {
+    // First time — add layers
     addTreeLayers()
   }
 })
