@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["pyarrow", "requests", "geoarrow-pyarrow"]
+# dependencies = ["pyarrow", "requests"]
 # ///
 
 import sys
@@ -9,7 +9,6 @@ import io
 import requests
 import pyarrow as pa
 import pyarrow.csv as pv
-import geoarrow.pyarrow as ga
 from datetime import datetime, timezone
 
 DATASET_ID = "rzic-39gi"
@@ -50,13 +49,6 @@ def load_arrow_table(csv_bytes: io.BytesIO) -> pa.Table:
     )
 
 
-def convert_geom_column(table: pa.Table, col: str = "the_geom") -> pa.Table:
-    wkt_array = ga.array(table.column(col))
-    geo_array = ga.as_geoarrow(wkt_array)
-    idx = table.schema.get_field_index(col)
-    return table.set_column(idx, col, geo_array)
-
-
 def add_rows_updated_at_column(table: pa.Table, updated_at: datetime) -> pa.Table:
     n = table.num_rows
 
@@ -77,6 +69,5 @@ if __name__ == "__main__":
     rows_updated_at = fetch_rows_updated_at()
     csv_bytes = download_csv()
     table = load_arrow_table(csv_bytes)
-    table = convert_geom_column(table)
     table = add_rows_updated_at_column(table, rows_updated_at)
     emit(table)

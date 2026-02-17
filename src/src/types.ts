@@ -10,3 +10,15 @@ export interface RawTree {
 }
 
 export type TreeCategory = 'palm' | 'broadleaf' | 'spreading' | 'coniferous' | 'columnar' | 'ornamental' | 'default'
+
+export interface RawLandmark {
+  name: string
+  latitude: number
+  longitude: number
+}
+
+export interface Landmark {
+  name: string
+  lng: number
+  lat: number
+}

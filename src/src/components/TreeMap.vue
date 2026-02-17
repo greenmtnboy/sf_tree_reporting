@@ -9,12 +9,14 @@ import { ref, onMounted, onUnmounted, watch } from 'vue'
 import maplibregl from 'maplibre-gl'
 import { useTreeData } from '../composables/useTreeData'
 import { registerTreeIcons, CATEGORY_COLORS } from '../composables/useTreeCategories'
+import { useFlyTo } from '../composables/useFlyTo'
 import type { TreeCategory } from '../types'
 
 const mapContainer = ref<HTMLDivElement>()
 let map: maplibregl.Map | null = null
 
 const { geojson, loading, error } = useTreeData()
+const { target: flyToTarget } = useFlyTo()
 
 function buildColorExpression(): maplibregl.ExpressionSpecification {
   const entries = Object.entries(CATEGORY_COLORS)
@@ -209,6 +211,19 @@ watch(geojson, () => {
   if (map?.loaded() && geojson.value && !map.getSource('trees')) {
     addTreeLayers()
   }
+})
+
+// Swoop camera to landmark
+watch(flyToTarget, (t) => {
+  if (!map || !t) return
+  map.flyTo({
+    center: [t.lng, t.lat],
+    zoom: t.zoom ?? 16,
+    pitch: 60,
+    bearing: map.getBearing(),
+    duration: 2500,
+    essential: true,
+  })
 })
 
 onUnmounted(() => {

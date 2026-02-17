@@ -14,12 +14,13 @@ property landmark_id.criteria_3 string; # designation criteria 3 code
 property landmark_id.criteria_1_text string; # description of criteria 1
 property landmark_id.criteria_2_text string; # description of criteria 2
 property landmark_id.criteria_3_text string; # description of criteria 3
-property landmark_id.geometry struct<x:int, y:int>; # multipolygon geometry (WKT/GeoJSON representation)
+property landmark_id.geometry_raw string; # multipolygon geometry (WKT/GeoJSON representation)
 key data_updated_through datetime; # timestamp of last data update
 
-
-auto latitude <- geometry::float;
-auto longitude <- geometry::string;
+auto geometry <- geo_from_text(geometry_raw);
+auto geo_centroid <- geo_centroid(geometry);
+auto longitude <- geo_x(geo_centroid);
+auto latitude <- geo_y(geo_centroid);
 
 root datasource raw_landmark_info (
     OBJECTID: landmark_id,
@@ -36,7 +37,7 @@ root datasource raw_landmark_info (
     crit1txt: ?criteria_1_text,
     crit2txt: ?criteria_2_text,
     crit3txt: ?criteria_3_text,
-    the_geom: ?geometry,
+    the_geom: ?geometry_raw,
     rows_updated_at: data_updated_through
 )
 grain (landmark_id)

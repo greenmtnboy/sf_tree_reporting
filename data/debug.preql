@@ -1,0 +1,4 @@
+import raw.landmarks;
+
+where name like '%Bridge%'
+select name, latitude, longitude limit 100;
