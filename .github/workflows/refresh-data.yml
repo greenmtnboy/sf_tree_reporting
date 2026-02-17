@@ -1,0 +1,52 @@
+name: Refresh Data
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh data
+        id: refresh_step
+        run: |
+          # Run the refresh and capture the exit code
+          set +e
+          trilogy refresh data \
+            --env GOOGLE_HMAC_KEY=${{ secrets.GOOGLE_HMAC_KEY }} \
+            --env GOOGLE_HMAC_SECRET=${{ secrets.GOOGLE_HMAC_SECRET }}
+          EXIT_CODE=$?
+          set -e
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "Changes detected. Running downstream preql..."
+            trilogy run data/core.preql \
+              --env GOOGLE_HMAC_KEY=${{ secrets.GOOGLE_HMAC_KEY }} \
+              --env GOOGLE_HMAC_SECRET=${{ secrets.GOOGLE_HMAC_SECRET }}
+            trilogy run data/satellite_data.preql \
+              --env GOOGLE_HMAC_KEY=${{ secrets.GOOGLE_HMAC_KEY }} \
+              --env GOOGLE_HMAC_SECRET=${{ secrets.GOOGLE_HMAC_SECRET }}
+            trilogy run data/engine_data.preql \
+              --env GOOGLE_HMAC_KEY=${{ secrets.GOOGLE_HMAC_KEY }} \
+              --env GOOGLE_HMAC_SECRET=${{ secrets.GOOGLE_HMAC_SECRET }}
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "Data is already fresh. Skipping downstream run."
+          else
+            echo "Error: Refresh script failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi

@@ -1,0 +1,14 @@
+.env
+__pycache__/
+.venv
+.tmp
+.claude
+node_modules/
+
+dist/
+
+playwright-report/
+test-results/
+
+*.pyc
+

@@ -1,0 +1,18 @@
+import raw.tree_info;
+
+copy into json `./raw_data.json` from
+where plant_type = 'Tree'
+SELECT
+    tree_id,
+    # plant_type,
+    common_name,
+    q_site_info,
+    plant_date,
+    q_species,
+    # q_legal_status,
+    latitude,
+    longitude,
+    diameter_at_breast_height
+order by plant_date asc
+limit 10000
+;

@@ -1,0 +1,187 @@
+import type { TreeCategory } from '../types'
+
+interface CategoryInfo {
+  category: TreeCategory
+  color: string
+  label: string
+}
+
+const GENUS_TO_CATEGORY: Record<string, TreeCategory> = {
+  washingtonia: 'palm',
+  lophostemon: 'broadleaf',
+  pittosporum: 'broadleaf',
+  ulmus: 'broadleaf',
+  magnolia: 'broadleaf',
+  ligustrum: 'broadleaf',
+  olea: 'broadleaf',
+  ginkgo: 'broadleaf',
+  acer: 'broadleaf',
+  platanus: 'spreading',
+  acacia: 'spreading',
+  callistemon: 'coniferous',
+  melaleuca: 'coniferous',
+  metrosideros: 'coniferous',
+  tristaniopsis: 'columnar',
+  tristania: 'columnar',
+  geijera: 'columnar',
+  prunus: 'ornamental',
+  pyrus: 'ornamental',
+  ceanothus: 'ornamental',
+  dodonaea: 'ornamental',
+  hymenosporum: 'ornamental',
+  myoporum: 'broadleaf',
+  cupressus: 'coniferous',
+}
+
+export const CATEGORY_COLORS: Record<TreeCategory, string> = {
+  palm: '#e6a835',
+  broadleaf: '#4CAF50',
+  spreading: '#8BC34A',
+  coniferous: '#2E7D32',
+  columnar: '#43A047',
+  ornamental: '#E91E63',
+  default: '#66BB6A',
+}
+
+const CATEGORY_LABELS: Record<TreeCategory, string> = {
+  palm: 'Palm',
+  broadleaf: 'Broadleaf',
+  spreading: 'Spreading',
+  coniferous: 'Coniferous',
+  columnar: 'Columnar',
+  ornamental: 'Ornamental',
+  default: 'Other',
+}
+
+export function getTreeCategory(qSpecies: string): CategoryInfo {
+  const genus = qSpecies.split('::')[0].trim().split(' ')[0].toLowerCase()
+  const category = GENUS_TO_CATEGORY[genus] ?? 'default'
+  return {
+    category,
+    color: CATEGORY_COLORS[category],
+    label: CATEGORY_LABELS[category],
+  }
+}
+
+/** Generate a canvas image for a tree category silhouette */
+function drawTreeIcon(category: TreeCategory, size: number): HTMLCanvasElement {
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')!
+  const color = CATEGORY_COLORS[category]
+  const cx = size / 2
+  const bottom = size - 2
+
+  ctx.fillStyle = '#5D4037'
+  ctx.strokeStyle = 'none'
+
+  switch (category) {
+    case 'palm': {
+      // Tall trunk with fan fronds at top
+      const trunkW = size * 0.08
+      ctx.fillRect(cx - trunkW / 2, size * 0.35, trunkW, size * 0.6)
+      ctx.fillStyle = color
+      // Fronds radiating from top
+      for (let angle = -70; angle <= 70; angle += 28) {
+        ctx.save()
+        ctx.translate(cx, size * 0.35)
+        ctx.rotate((angle * Math.PI) / 180)
+        ctx.beginPath()
+        ctx.ellipse(0, -size * 0.22, size * 0.08, size * 0.25, 0, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.restore()
+      }
+      break
+    }
+    case 'broadleaf': {
+      // Round canopy on a short trunk
+      const trunkW = size * 0.1
+      ctx.fillRect(cx - trunkW / 2, size * 0.55, trunkW, size * 0.4)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.arc(cx, size * 0.38, size * 0.32, 0, Math.PI * 2)
+      ctx.fill()
+      break
+    }
+    case 'spreading': {
+      // Wide flat canopy
+      const trunkW = size * 0.1
+      ctx.fillRect(cx - trunkW / 2, size * 0.5, trunkW, size * 0.45)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.ellipse(cx, size * 0.38, size * 0.42, size * 0.22, 0, 0, Math.PI * 2)
+      ctx.fill()
+      break
+    }
+    case 'coniferous': {
+      // Sharp Christmas tree / conifer shape
+      const trunkW = size * 0.08
+      ctx.fillRect(cx - trunkW / 2, size * 0.7, trunkW, size * 0.25)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.moveTo(cx, size * 0.08)
+      ctx.lineTo(cx + size * 0.28, size * 0.72)
+      ctx.lineTo(cx - size * 0.28, size * 0.72)
+      ctx.closePath()
+      ctx.fill()
+      break
+    }
+    case 'columnar': {
+      // Rounded narrow / columnar deciduous (e.g. Australian Willow)
+      const trunkW = size * 0.08
+      ctx.fillRect(cx - trunkW / 2, size * 0.6, trunkW, size * 0.35)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.ellipse(cx, size * 0.38, size * 0.2, size * 0.32, 0, 0, Math.PI * 2)
+      ctx.fill()
+      break
+    }
+    case 'ornamental': {
+      // Small rounded tree with visible bloom dots
+      const trunkW = size * 0.08
+      ctx.fillRect(cx - trunkW / 2, size * 0.55, trunkW, size * 0.4)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.arc(cx, size * 0.4, size * 0.26, 0, Math.PI * 2)
+      ctx.fill()
+      // Bloom highlights
+      ctx.fillStyle = '#F8BBD0'
+      for (const [ox, oy] of [[-0.1, -0.08], [0.12, 0.04], [-0.04, 0.1], [0.08, -0.12]]) {
+        ctx.beginPath()
+        ctx.arc(cx + size * ox, size * 0.4 + size * oy, size * 0.05, 0, Math.PI * 2)
+        ctx.fill()
+      }
+      break
+    }
+    default: {
+      // Generic round tree
+      const trunkW = size * 0.1
+      ctx.fillRect(cx - trunkW / 2, size * 0.55, trunkW, size * 0.4)
+      ctx.fillStyle = color
+      ctx.beginPath()
+      ctx.arc(cx, size * 0.38, size * 0.3, 0, Math.PI * 2)
+      ctx.fill()
+      break
+    }
+  }
+
+  return canvas
+}
+
+const ALL_CATEGORIES: TreeCategory[] = ['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default']
+
+/** Register all tree icons with a MapLibre map instance */
+export function registerTreeIcons(map: maplibregl.Map, size = 48): void {
+  for (const cat of ALL_CATEGORIES) {
+    const canvas = drawTreeIcon(cat, size)
+    const imageData = canvas.getContext('2d')!.getImageData(0, 0, size, size)
+    if (!map.hasImage(`tree-${cat}`)) {
+      map.addImage(`tree-${cat}`, {
+        width: size,
+        height: size,
+        data: new Uint8Array(imageData.data.buffer),
+      })
+    }
+  }
+}
