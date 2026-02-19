@@ -2,7 +2,7 @@ import std.geography;
 
 key tree_id int; # unique identifier for the tree record
 property tree_id.q_legal_status string; # legal/administrative status of the tree
-property tree_id.q_species string; # scientific and common species name
+key species string; # scientific and common species name
 property tree_id.q_address string; # address where the tree is planted
 property tree_id.site_order string; # internal ordering for site location
 property tree_id.q_site_info string; # contextual site attributes (e.g., median, sidewalk)
@@ -20,13 +20,15 @@ property tree_id.longitude float::longitude; # geographic longitude for mapping
 property tree_id.location string; # location string representation
 key data_updated_through datetime; # timestamp of last data update
 
-auto common_name <- coalesce(nullif(split(q_species, '::')[2],''),split(q_species, '::')[1]);
+auto common_name <- coalesce(nullif(split(species, '::')[2],''),split(species, '::')[1]);
 
+# species section
+property species.species_is_enriched bool; # whether the species has been enriched with additional data
 
 root datasource raw_tree_info (
     TreeID: tree_id,
     qLegalStatus: ?q_legal_status,
-    qSpecies: q_species,
+    qSpecies: species,
     qAddress: ?q_address,
     SiteOrder: ?site_order,
     qSiteInfo: q_site_info,
@@ -52,7 +54,7 @@ freshness by data_updated_through;
 datasource tree_info (
     tree_id,
     ?q_legal_status,
-    q_species,
+    species,
     ?q_address,
     ?site_order,
     q_site_info,
@@ -73,3 +75,4 @@ datasource tree_info (
 grain (tree_id)
 file `https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_info.parquet`:`gcs://trilogy_public_models/duckdb/sf_trees/tree_info.parquet`
 freshness by data_updated_through;
+

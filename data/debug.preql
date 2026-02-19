@@ -1,4 +1,5 @@
-import raw.landmarks;
+import raw.tree_info;
 
-where name like '%Bridge%'
-select name, latitude, longitude limit 100;
+
+select count_distinct(split(split(q_species, '::')[1], ' ')[1]) as genus_count
+;

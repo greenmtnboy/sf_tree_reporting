@@ -2,14 +2,32 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
+const stubMotherDuck = {
+  name: 'stub-motherduck',
+  resolveId(id: string) {
+    if (id === '@motherduck/wasm-client') return '\0virtual:motherduck'
+  },
+  load(id: string) {
+    if (id === '\0virtual:motherduck') return 'export const MDConnection = undefined'
+  },
+}
+
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), stubMotherDuck],
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
     },
   },
+  server: {
+    sourcemapIgnoreList: (sourcePath) => sourcePath.includes('@duckdb/duckdb-wasm'),
+  },
   optimizeDeps: {
-    exclude: ['@duckdb/duckdb-wasm'],
+    exclude: ['@duckdb/duckdb-wasm', '@motherduck/wasm-client'],
+  },
+  build: {
+    rollupOptions: {
+      external: ['@motherduck/wasm-client'],
+    },
   },
 })

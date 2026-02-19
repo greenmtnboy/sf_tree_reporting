@@ -113,6 +113,8 @@ function addTreeLayers() {
         18, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.4, 30, 0.9],
         20, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.5, 30, 1.2],
       ],
+      'icon-rotate': ['get', 'rotation'],
+      'icon-rotation-alignment': 'viewport',
       'icon-allow-overlap': true,
       'icon-ignore-placement': true,
     },
@@ -133,6 +135,7 @@ function addTreeLayers() {
       .setHTML(`
         <strong>${p.commonName}</strong><br/>
         <em>${p.species}</em><br/>
+        ID: ${p.id}<br/>
         Planted: ${p.plantDate?.split(' ')[0] ?? 'Unknown'}<br/>
         DBH: ${p.dbh}"
       `)
@@ -150,6 +153,7 @@ function addTreeLayers() {
       .setHTML(`
         <strong>${p.commonName}</strong><br/>
         <em>${p.species}</em><br/>
+        ID: ${p.id}<br/>
         Planted: ${p.plantDate?.split(' ')[0] ?? 'Unknown'}<br/>
         DBH: ${p.dbh}"
       `)
@@ -228,17 +232,41 @@ watch(currentGeoJSON, (newData) => {
   }
 })
 
-// Swoop camera to landmark
+// Compute bearing from current map center to a target point
+function bearingTo(from: [number, number], to: [number, number]): number {
+  const toRad = (d: number) => (d * Math.PI) / 180
+  const toDeg = (r: number) => (r * 180) / Math.PI
+  const dLon = toRad(to[0] - from[0])
+  const lat1 = toRad(from[1])
+  const lat2 = toRad(to[1])
+  const y = Math.sin(dLon) * Math.cos(lat2)
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon)
+  return (toDeg(Math.atan2(y, x)) + 360) % 360
+}
+
+// Swoop camera to landmark — pivot to face the target first, then fly
 watch(flyToTarget, (t) => {
   if (!map || !t) return
-  map.flyTo({
-    center: [t.lng, t.lat],
-    zoom: t.zoom ?? 16,
-    pitch: 60,
-    bearing: map.getBearing(),
-    duration: 2500,
-    essential: true,
+  const center = map.getCenter()
+  const targetBearing = bearingTo([center.lng, center.lat], [t.lng, t.lat])
+
+  // Rotate to face the destination, then blend into the swoop
+  map.easeTo({
+    bearing: targetBearing,
+    duration: 3000,
+    easing: (x) => x * (2 - x), // ease-out quad
   })
+  // Kick off the fly before the rotation fully settles so they overlap
+  setTimeout(() => {
+    map!.flyTo({
+      center: [t.lng, t.lat],
+      zoom: t.zoom ?? 16,
+      pitch: 60,
+      bearing: targetBearing,
+      duration: 2500,
+      essential: true,
+    })
+  }, 2200)
 })
 
 onUnmounted(() => {

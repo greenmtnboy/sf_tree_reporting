@@ -14,5 +14,4 @@ SELECT
     longitude,
     diameter_at_breast_height
 order by plant_date asc
-limit 10000
 ;

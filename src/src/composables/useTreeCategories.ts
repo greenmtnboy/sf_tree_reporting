@@ -166,6 +166,36 @@ function drawTreeIcon(category: TreeCategory, size: number): HTMLCanvasElement {
     }
   }
 
+  // Faint outline around the whole tree silhouette
+  ctx.globalCompositeOperation = 'source-over'
+  const outlineData = ctx.getImageData(0, 0, size, size)
+  const od = outlineData.data
+  // Draw a 1px stroke around non-transparent pixels
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)'
+  ctx.lineWidth = 1.5
+  ctx.globalCompositeOperation = 'destination-over'
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const i = (y * size + x) * 4
+      if (od[i + 3] > 0) {
+        // Check if any neighbor is transparent (edge pixel)
+        const neighbors = [
+          ((y - 1) * size + x) * 4,
+          ((y + 1) * size + x) * 4,
+          (y * size + x - 1) * 4,
+          (y * size + x + 1) * 4,
+        ]
+        for (const ni of neighbors) {
+          if (od[ni + 3] === 0) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)'
+            ctx.fillRect(x - 0.5, y - 0.5, 1.5, 1.5)
+            break
+          }
+        }
+      }
+    }
+  }
+
   return canvas
 }
 

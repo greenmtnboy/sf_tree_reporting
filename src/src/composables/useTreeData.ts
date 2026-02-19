@@ -7,6 +7,23 @@ export interface TreeGeoJSON {
   features: GeoJSON.Feature<GeoJSON.Point>[]
 }
 
+// ~1 meter jitter so co-located trees spread slightly without drifting into streets
+const JITTER = 0.00001
+
+export function jitterCoord(coord: number): number {
+  return coord + (Math.random() - 0.5) * 2 * JITTER
+}
+
+// Small lean angle (±10°) for natural variation
+export function randomRotation(): number {
+  return (Math.random() - 0.5) * 20
+}
+
+// Per-tree size multiplier (0.7–1.3) so same-species trees are visually distinct
+export function randomSizeScale(): number {
+  return 0.7 + Math.random() * 0.6
+}
+
 export function useTreeData() {
   const geojson = ref<TreeGeoJSON | null>(null)
   const loading = ref(true)
@@ -18,15 +35,27 @@ export function useTreeData() {
       if (!res.ok) throw new Error(`Failed to fetch tree data: ${res.status}`)
       const raw: RawTree[] = await res.json()
 
-      const features: GeoJSON.Feature<GeoJSON.Point>[] = raw
-        .filter((t) => t.latitude && t.longitude)
+      const valid = raw.filter((t) => t.latitude && t.longitude)
+
+      // Count trees per location to detect co-located groups
+      const locCounts = new Map<string, number>()
+      for (const t of valid) {
+        const key = `${t.latitude},${t.longitude}`
+        locCounts.set(key, (locCounts.get(key) || 0) + 1)
+      }
+
+      const features: GeoJSON.Feature<GeoJSON.Point>[] = valid
         .map((tree) => {
           const { category, color } = getTreeCategory(tree.q_species)
+          const key = `${tree.latitude},${tree.longitude}`
+          const isCoLocated = (locCounts.get(key) || 0) > 1
           return {
             type: 'Feature' as const,
             geometry: {
               type: 'Point' as const,
-              coordinates: [tree.longitude, tree.latitude],
+              coordinates: isCoLocated
+                ? [jitterCoord(tree.longitude), jitterCoord(tree.latitude)]
+                : [tree.longitude, tree.latitude],
             },
             properties: {
               id: tree.tree_id,
@@ -36,6 +65,8 @@ export function useTreeData() {
               dbh: tree.diameter_at_breast_height ?? 3,
               category,
               color,
+              rotation: isCoLocated ? randomRotation() : 0,
+              sizeScale: randomSizeScale(),
             },
           }
         })
