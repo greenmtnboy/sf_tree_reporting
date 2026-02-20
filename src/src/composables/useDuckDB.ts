@@ -63,6 +63,7 @@ type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }
 const dataTileBoundsByZoom = new Map<number, TileBounds>()
 const visibleTileRangeByZoom = new Map<number, TileBounds>()
 const hasAggCacheByZoom = new Set<number>()
+const prefetchedVisibleRangeSigByZoom = new Map<number, string>()
 let activeTileRequests = 0
 let activeDuckdbCalls = 0
 const MAX_PARALLEL_TILE_WORK = 2
@@ -646,7 +647,10 @@ async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, bas
   let maxY = Math.min(tileCount - 1, minY + blockSize - 1)
 
   const visibleRange = getVisibleTileRange(z)
-  if (visibleRange && x >= visibleRange.minX && x <= visibleRange.maxX && y >= visibleRange.minY && y <= visibleRange.maxY) {
+  if (visibleRange) {
+    // Collapse detailed-tile fan-out into one viewport-sized batch per
+    // zoom/range. This prevents per-block query churn during animated zoom
+    // sequences where the protocol requests many neighboring tiles.
     minX = visibleRange.minX
     maxX = visibleRange.maxX
     minY = visibleRange.minY
@@ -1332,6 +1336,7 @@ export function useDuckDB() {
     preparedFeatureTableRevisionByZoom.clear()
     inflightFeatureTableBuild.clear()
     visibleTileRangeByZoom.clear()
+    prefetchedVisibleRangeSigByZoom.clear()
     prewarmDoneRevision = -1
     prewarmPromise = null
     resetTimingBuckets()
@@ -1355,6 +1360,27 @@ export function useDuckDB() {
       minY: Math.floor(Math.min(minY, maxY)),
       maxY: Math.floor(Math.max(minY, maxY)),
     })
+  }
+
+  async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<void> {
+    await ensureInit()
+    if (!conn || !spatialExtensionReady || z < 15) return
+
+    const range = getVisibleTileRange(z)
+    if (!range) return
+
+    const sig = `${tileQueryRevision}:${z}:${range.minX}-${range.maxX}:${range.minY}-${range.maxY}`
+    if (prefetchedVisibleRangeSigByZoom.get(z) === sig) return
+
+    const baseQuery = sanitizeBaseQuery(tileQuerySql.value)
+    if (z === 15) {
+      await ensurePreparedFeatureTableForZoom(15, baseQuery)
+    }
+
+    const centerX = Math.floor((range.minX + range.maxX) / 2)
+    const centerY = Math.floor((range.minY + range.maxY) / 2)
+    await ensureNeighborhoodBatchTiles(z, centerX, centerY, baseQuery)
+    prefetchedVisibleRangeSigByZoom.set(z, sig)
   }
 
   async function prewarmLodCaches(): Promise<void> {
@@ -1456,6 +1482,7 @@ export function useDuckDB() {
     setViewportZoom,
     setViewportCenter,
     setVisibleTileRange,
+    prefetchVisibleDetailTilesAtZoom,
     prewarmLodCaches,
   }
 }

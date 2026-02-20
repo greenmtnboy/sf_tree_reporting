@@ -32,6 +32,7 @@ let introStarted = false
 let introRafId: number | null = null
 let introCancelled = false
 let lastVisibleRangeSig = ''
+const introLockedRangeByZoom = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>()
 
 const {
   query: duckQuery,
@@ -40,6 +41,7 @@ const {
   setViewportZoom,
   setViewportCenter,
   setVisibleTileRange,
+  prefetchVisibleDetailTilesAtZoom,
   prewarmLodCaches,
 } = useDuckDB()
 const { categoryIcons, loading, error, getSpeciesEnrichment } = useTreeData()
@@ -168,6 +170,12 @@ async function runIntroZoomOut() {
         startBearing,
         startPitch,
       )
+
+      const stageZoom = Math.round(checkpoints[i + 1])
+      if (stageZoom >= 15) {
+        await prefetchVisibleDetailTilesAtZoom(stageZoom)
+      }
+
       await waitForTreesMilestone(2500)
     }
   } finally {
@@ -180,6 +188,7 @@ async function runIntroZoomOut() {
       })
     }
     introActive.value = false
+    introLockedRangeByZoom.clear()
     setMapInteractions(true)
   }
 }
@@ -465,6 +474,18 @@ function updateZoomLevel() {
     let minY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getNorth())))
     let maxY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getSouth())))
 
+    if (introActive.value && z >= 15) {
+      const locked = introLockedRangeByZoom.get(z)
+      if (locked) {
+        minX = locked.minX
+        maxX = locked.maxX
+        minY = locked.minY
+        maxY = locked.maxY
+      } else {
+        introLockedRangeByZoom.set(z, { minX, maxX, minY, maxY })
+      }
+    }
+
     // Expanding range every animation frame during intro can create excessive
     // tile churn and stall startup. Only apply wide prefetch once intro ends.
     if (isInitialLoading.value && !introActive.value) {
@@ -509,7 +530,8 @@ onMounted(() => {
             'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
             'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
           ],
-          tileSize: 256,
+          // Use larger raster tiles to reduce base-layer tile churn/pop-in.
+          tileSize: 512,
           attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
         },
       },
@@ -520,6 +542,10 @@ onMounted(() => {
           source: 'carto-dark',
           minzoom: 0,
           maxzoom: 20,
+          paint: {
+            'raster-resampling': 'linear',
+            'raster-fade-duration': 150,
+          },
         },
       ],
     },
