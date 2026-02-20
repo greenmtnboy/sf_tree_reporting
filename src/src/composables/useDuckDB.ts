@@ -44,17 +44,25 @@ let tileQueryRevision = 0
 const activeViewportZoom = ref<number>(13)
 const activeViewportCenter = ref<{ lng: number; lat: number } | null>(null)
 const tileCache = new Map<string, Uint8Array>()
+const emptyTileKeys = new Set<string>()
 const inflightTileRequests = new Map<string, Promise<Uint8Array>>()
 const zoomBatchReady = new Set<string>()
 const inflightZoomBatch = new Map<string, Promise<void>>()
 const inflightNeighborhoodBatch = new Map<string, Promise<void>>()
-const MAX_TILE_CACHE_ENTRIES = 512
+const preparedFeatureTableRevisionByZoom = new Map<number, number>()
+const inflightFeatureTableBuild = new Map<string, Promise<void>>()
+const MAX_TILE_CACHE_ENTRIES = 1536
+let spatialExtensionReady = false
+type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }
+const dataTileBoundsByZoom = new Map<number, TileBounds>()
 let activeTileRequests = 0
 let activeDuckdbCalls = 0
 const MAX_PARALLEL_TILE_WORK = 2
 let activeQueuedWorkers = 0
 let queueLastLoggedAt = 0
 let timingLastLoggedAt = 0
+let prewarmDoneRevision = -1
+let prewarmPromise: Promise<void> | null = null
 const WEB_MERCATOR_MAX = 20037508.342789244
 const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
 
@@ -166,6 +174,49 @@ function tileXExpr(alias: string, z: number): string {
 function tileYExpr(alias: string, z: number): string {
   if (z >= 13 && z <= 20) return `${alias}.ytile_z${z}`
   return `CAST(floor((${WEB_MERCATOR_MAX} - (${alias}.y_3857)) / (${WEB_MERCATOR_WORLD} / pow(2, ${z}))) AS INTEGER)`
+}
+
+function getDataTileBounds(z: number): TileBounds | null {
+  return dataTileBoundsByZoom.get(z) ?? null
+}
+
+function isTileOutsideDataBounds(z: number, x: number, y: number): boolean {
+  const b = getDataTileBounds(z)
+  if (!b) return false
+  return x < b.minX || x > b.maxX || y < b.minY || y > b.maxY
+}
+
+function baseSimplifyGridMetersForZoom(z: number): number {
+  return z <= 10 ? 256 : z <= 12 ? 128 : z <= 13 ? 64 : z <= 14 ? 32 : 0
+}
+
+function adaptiveLodForTile(z: number, x: number, y: number): { simplifyGridMeters: number; tileDistance: number | null } {
+  let simplifyGridMeters = baseSimplifyGridMetersForZoom(z)
+  if (simplifyGridMeters > 0) {
+    return { simplifyGridMeters, tileDistance: null }
+  }
+
+  const viewport = activeViewportCenter.value
+  if (!viewport) {
+    return { simplifyGridMeters, tileDistance: null }
+  }
+
+  const center = lngLatToTile(viewport.lng, viewport.lat, z)
+  const tileDistance = Math.max(Math.abs(x - center.x), Math.abs(y - center.y))
+
+  // Isometric view requests many tiles in the distance. Reduce detail as tiles
+  // move farther from the camera center to cut query pressure.
+  if (z === 15) {
+    if (tileDistance > 12) simplifyGridMeters = 96
+    else if (tileDistance > 8) simplifyGridMeters = 64
+    else if (tileDistance > 5) simplifyGridMeters = 32
+  } else if (z === 16) {
+    if (tileDistance > 14) simplifyGridMeters = 64
+    else if (tileDistance > 10) simplifyGridMeters = 32
+    else if (tileDistance > 7) simplifyGridMeters = 16
+  }
+
+  return { simplifyGridMeters, tileDistance }
 }
 
 async function doInit() {
@@ -308,13 +359,39 @@ async function doInit() {
   `)
   console.info('[Perf] duckdb:trees_fast:done', { ms: Math.round(nowMs() - tFastStart) })
 
+  // Cache dataset tile bounds per zoom to fast-reject empty/out-of-range tiles.
+  dataTileBoundsByZoom.clear()
+  for (let z = 13; z <= 20; z += 1) {
+    const result = await conn.query(`
+      SELECT
+        MIN(xtile_z${z}) AS min_x,
+        MAX(xtile_z${z}) AS max_x,
+        MIN(ytile_z${z}) AS min_y,
+        MAX(ytile_z${z}) AS max_y
+      FROM trees_fast
+    `)
+    const row = result.toArray()[0] as Record<string, unknown> | undefined
+    if (!row) continue
+    const minX = Number(row.min_x)
+    const maxX = Number(row.max_x)
+    const minY = Number(row.min_y)
+    const maxY = Number(row.max_y)
+    if ([minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) {
+      dataTileBoundsByZoom.set(z, { minX, maxX, minY, maxY })
+    }
+  }
+  console.info('[Perf] duckdb:data-bounds:done', { zooms: Array.from(dataTileBoundsByZoom.keys()) })
+
   // Spatial extension for on-demand MVT generation
+  spatialExtensionReady = false
   try {
     await conn.query('LOAD spatial;')
+    spatialExtensionReady = true
   } catch {
     try {
       await conn.query('INSTALL spatial;')
       await conn.query('LOAD spatial;')
+      spatialExtensionReady = true
     } catch (e) {
       console.error('DuckDB spatial extension unavailable:', e)
     }
@@ -355,11 +432,15 @@ function zoomBatchKey(rev: number, z: number): string {
 }
 
 function shouldUseZoomBatch(z: number): boolean {
-  // Batch by zoom for the costly ranges where many nearby tiles are requested together.
-  return z >= 13 && z <= 16
+  // Keep zoom-batch for low/medium LOD aggregated tiers.
+  // Detailed tiers (z>=15) are handled by neighborhood batching.
+  return z >= 13 && z <= 14
 }
 
 function neighborhoodBlockSizeForZoom(z: number): number {
+  // z15 is the current hotspot: use a larger block to cut request count.
+  if (z === 15) return 8
+  if (z === 16) return 6
   if (z >= 19) return 4
   if (z >= 17) return 6
   return 1
@@ -367,6 +448,99 @@ function neighborhoodBlockSizeForZoom(z: number): number {
 
 function neighborhoodBatchKey(rev: number, z: number, minX: number, maxX: number, minY: number, maxY: number): string {
   return `${rev}:${z}:${minX}-${maxX}:${minY}-${maxY}`
+}
+
+function featureTableBuildKey(rev: number, z: number): string {
+  return `${rev}:${z}`
+}
+
+function featureTableName(z: number): string {
+  return `tile_features_z${z}`
+}
+
+async function ensurePreparedFeatureTableForZoom(z: number, baseQuery: string): Promise<void> {
+  if (!conn) return
+  // z15 was identified as the hotspot; keep scope tight for now.
+  if (z !== 15) return
+
+  const rev = tileQueryRevision
+  if (preparedFeatureTableRevisionByZoom.get(z) === rev) return
+
+  const key = featureTableBuildKey(rev, z)
+  const inflight = inflightFeatureTableBuild.get(key)
+  if (inflight) {
+    await inflight
+    return
+  }
+
+  const startedAt = nowMs()
+  const xExpr = tileXExpr('tf', z)
+  const yExpr = tileYExpr('tf', z)
+  const table = featureTableName(z)
+
+  const request = (async () => {
+    const sql = `
+CREATE OR REPLACE TEMP TABLE ${table} AS
+WITH base AS (
+  ${baseQuery}
+), rows AS (
+  SELECT
+    ${xExpr} AS xtile,
+    ${yExpr} AS ytile,
+    {
+      'geom': ST_AsMVTGeom(
+        ST_Point(tf.x_3857, tf.y_3857),
+        ST_Extent(ST_TileEnvelope(${z}, ${xExpr}, ${yExpr})),
+        4096,
+        64,
+        true
+      ),
+      'id': COALESCE(base.tree_id, tf.tree_id, 0),
+      'dbh': TRY_CAST(COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS DOUBLE),
+      'category': COALESCE(tf.tree_category, 'default'),
+      'rotation': 0
+    } AS feature
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+)
+SELECT xtile, ytile, feature
+FROM rows
+WHERE xtile >= 0
+  AND ytile >= 0
+  AND xtile < CAST(pow(2, ${z}) AS INTEGER)
+  AND ytile < CAST(pow(2, ${z}) AS INTEGER)
+  AND feature.geom IS NOT NULL
+  AND NOT ST_IsEmpty(feature.geom)
+`
+
+    activeDuckdbCalls += 1
+    try {
+      logIconTileDebug('feature-table:start', { z, rev, table })
+      const queryStartedAt = nowMs()
+      await conn.query(sql)
+      const queryMs = nowMs() - queryStartedAt
+      recordDuckdbTiming('zoom-batch', queryMs, { z, rev, lodMode: 'feature-table-build' })
+      if (rev === tileQueryRevision) {
+        preparedFeatureTableRevisionByZoom.set(z, rev)
+      }
+      logIconTileDebug('feature-table:done', {
+        z,
+        rev,
+        table,
+        ms: Math.round(nowMs() - startedAt),
+      })
+    } finally {
+      activeDuckdbCalls -= 1
+    }
+  })()
+
+  inflightFeatureTableBuild.set(key, request)
+  try {
+    await request
+  } finally {
+    inflightFeatureTableBuild.delete(key)
+  }
 }
 
 async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, baseQuery: string): Promise<void> {
@@ -378,10 +552,24 @@ async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, bas
   const tileCount = Math.pow(2, z)
   const blockX = Math.floor(x / blockSize)
   const blockY = Math.floor(y / blockSize)
-  const minX = Math.max(0, blockX * blockSize)
-  const maxX = Math.min(tileCount - 1, minX + blockSize - 1)
-  const minY = Math.max(0, blockY * blockSize)
-  const maxY = Math.min(tileCount - 1, minY + blockSize - 1)
+  let minX = Math.max(0, blockX * blockSize)
+  let maxX = Math.min(tileCount - 1, minX + blockSize - 1)
+  let minY = Math.max(0, blockY * blockSize)
+  let maxY = Math.min(tileCount - 1, minY + blockSize - 1)
+
+  const dataBounds = getDataTileBounds(z)
+  if (dataBounds) {
+    minX = Math.max(minX, dataBounds.minX)
+    maxX = Math.min(maxX, dataBounds.maxX)
+    minY = Math.max(minY, dataBounds.minY)
+    maxY = Math.min(maxY, dataBounds.maxY)
+  }
+
+  if (minX > maxX || minY > maxY) {
+    const key = tileCacheKeyForRevision(rev, z, x, y)
+    setCachedTile(key, new Uint8Array())
+    return
+  }
   const bKey = neighborhoodBatchKey(rev, z, minX, maxX, minY, maxY)
 
   const inflight = inflightNeighborhoodBatch.get(bKey)
@@ -392,7 +580,23 @@ async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, bas
 
   const startedAt = nowMs()
   const request = (async () => {
-    const sql = `
+    const sql = z === 15 ? `
+WITH rows AS (
+  SELECT
+    xtile,
+    ytile,
+    feature
+  FROM ${featureTableName(15)}
+  WHERE xtile BETWEEN ${minX} AND ${maxX}
+    AND ytile BETWEEN ${minY} AND ${maxY}
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geom') AS mvt
+FROM rows
+GROUP BY xtile, ytile
+` : `
 WITH base AS (
   ${baseQuery}
 ), pts AS (
@@ -567,7 +771,10 @@ function queueTileRequest(z: number, x: number, y: number): Promise<Uint8Array> 
 
 function getCachedTile(key: string): Uint8Array | null {
   const tile = tileCache.get(key)
-  if (!tile) return null
+  if (!tile) {
+    if (emptyTileKeys.has(key)) return new Uint8Array()
+    return null
+  }
   // LRU bump
   tileCache.delete(key)
   tileCache.set(key, tile)
@@ -575,6 +782,15 @@ function getCachedTile(key: string): Uint8Array | null {
 }
 
 function setCachedTile(key: string, tile: Uint8Array): void {
+  if (tile.byteLength === 0) {
+    emptyTileKeys.add(key)
+    // Keep empty-tile markers out of the binary LRU cache to avoid evicting
+    // useful populated tiles during zoom transitions.
+    if (tileCache.has(key)) tileCache.delete(key)
+    return
+  }
+
+  emptyTileKeys.delete(key)
   if (tileCache.has(key)) tileCache.delete(key)
   tileCache.set(key, tile)
   if (tileCache.size > MAX_TILE_CACHE_ENTRIES) {
@@ -597,6 +813,14 @@ async function ensureZoomBatchTiles(z: number, baseQuery: string, simplifyGridMe
 
   const lodMode = simplifyGridMeters > 0 ? 'aggregated' : 'detailed'
   const startedAt = nowMs()
+  const bounds = getDataTileBounds(z)
+  const boundedFilter = bounds
+    ? `WHERE xtile BETWEEN ${bounds.minX} AND ${bounds.maxX}
+    AND ytile BETWEEN ${bounds.minY} AND ${bounds.maxY}`
+    : `WHERE xtile >= 0
+    AND ytile >= 0
+    AND xtile < CAST(pow(2, ${z}) AS INTEGER)
+    AND ytile < CAST(pow(2, ${z}) AS INTEGER)`
   const request = (async () => {
     const sql = simplifyGridMeters > 0 ? `
 WITH base AS (
@@ -614,10 +838,7 @@ WITH base AS (
 ), bounded AS (
   SELECT *
   FROM pts
-  WHERE xtile >= 0
-    AND ytile >= 0
-    AND xtile < CAST(pow(2, ${z}) AS INTEGER)
-    AND ytile < CAST(pow(2, ${z}) AS INTEGER)
+  ${boundedFilter}
 ), agg AS (
   SELECT
     xtile,
@@ -674,10 +895,7 @@ WITH base AS (
 ), bounded AS (
   SELECT *
   FROM points
-  WHERE xtile >= 0
-    AND ytile >= 0
-    AND xtile < CAST(pow(2, ${z}) AS INTEGER)
-    AND ytile < CAST(pow(2, ${z}) AS INTEGER)
+  ${boundedFilter}
 ), rows AS (
   SELECT
     xtile,
@@ -758,10 +976,13 @@ async function generatePointTileMvt(z: number, x: number, y: number): Promise<Ui
     const key = tileCacheKey(z, x, y)
     const isIconRange = z >= 15
 
-    // When the user is zoomed into icon/detail ranges, aggressively drop low-zoom
-    // tile work that MapLibre may still request during rapid zoom transitions.
-    // This prevents long DuckDB queue backlogs that delay visible high-zoom tiles.
-    if (activeViewportZoom.value >= 15 && z <= 14) {
+    if (isTileOutsideDataBounds(z, x, y)) {
+      return new Uint8Array()
+    }
+
+    // Only drop far lower-zoom requests while deeply zoomed in.
+    // Keep z13/z14 available so heat/circle layers render correctly after zooming back out.
+    if (activeViewportZoom.value >= 16 && z <= 12) {
       logIconTileDebug('dropped-stale-lowzoom', {
         z,
         x,
@@ -784,7 +1005,7 @@ async function generatePointTileMvt(z: number, x: number, y: number): Promise<Ui
     }
 
     const baseQuery = sanitizeBaseQuery(tileQuerySql.value)
-    const simplifyGridMeters = z <= 10 ? 256 : z <= 12 ? 128 : z <= 13 ? 64 : z <= 14 ? 32 : 0
+    const { simplifyGridMeters, tileDistance } = adaptiveLodForTile(z, x, y)
     const lodMode = simplifyGridMeters > 0 ? 'aggregated' : 'detailed'
     const bounds = tileBounds3857(z, x, y)
     const batchKey = zoomBatchKey(tileQueryRevision, z)
@@ -805,7 +1026,8 @@ async function generatePointTileMvt(z: number, x: number, y: number): Promise<Ui
       }
     }
 
-    if (simplifyGridMeters === 0 && z >= 17) {
+    if (simplifyGridMeters === 0 && z >= 15) {
+      await ensurePreparedFeatureTableForZoom(z, baseQuery)
       await ensureNeighborhoodBatchTiles(z, x, y, baseQuery)
       const neighborBatched = getCachedTile(key)
       if (neighborBatched) return neighborBatched
@@ -818,6 +1040,7 @@ async function generatePointTileMvt(z: number, x: number, y: number): Promise<Ui
       rev: tileQueryRevision,
       lodMode,
       simplifyGridMeters,
+      tileDistance,
       iconRange: isIconRange,
       activeTileRequests,
       activeDuckdbCalls,
@@ -966,10 +1189,15 @@ export function useDuckDB() {
     tileQuerySql.value = sql
     tileQueryRevision += 1
     tileCache.clear()
+    emptyTileKeys.clear()
     inflightTileRequests.clear()
     zoomBatchReady.clear()
     inflightZoomBatch.clear()
     inflightNeighborhoodBatch.clear()
+    preparedFeatureTableRevisionByZoom.clear()
+    inflightFeatureTableBuild.clear()
+    prewarmDoneRevision = -1
+    prewarmPromise = null
     resetTimingBuckets()
   }
 
@@ -981,6 +1209,50 @@ export function useDuckDB() {
   function setViewportCenter(lng: number, lat: number) {
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
     activeViewportCenter.value = { lng, lat }
+  }
+
+  async function prewarmLodCaches(): Promise<void> {
+    await ensureInit()
+    if (!conn) return
+    if (!spatialExtensionReady) {
+      console.info('[Perf] duckdb:prewarm:skipped', { reason: 'spatial-not-ready' })
+      return
+    }
+
+    const rev = tileQueryRevision
+    if (prewarmDoneRevision === rev) return
+    if (prewarmPromise) {
+      await prewarmPromise
+      return
+    }
+
+    const baseQuery = sanitizeBaseQuery(tileQuerySql.value)
+    prewarmPromise = (async () => {
+      const t0 = nowMs()
+      console.info('[Perf] duckdb:prewarm:start', { rev })
+      try {
+        await ensureZoomBatchTiles(13, baseQuery, 64)
+        await ensureZoomBatchTiles(14, baseQuery, 32)
+        await ensurePreparedFeatureTableForZoom(15, baseQuery)
+
+        const viewport = activeViewportCenter.value
+        if (viewport) {
+          const c15 = lngLatToTile(viewport.lng, viewport.lat, 15)
+          await ensureNeighborhoodBatchTiles(15, c15.x, c15.y, baseQuery)
+        }
+      } finally {
+        if (tileQueryRevision === rev) {
+          prewarmDoneRevision = rev
+        }
+        console.info('[Perf] duckdb:prewarm:done', { rev, ms: Math.round(nowMs() - t0) })
+      }
+    })()
+
+    try {
+      await prewarmPromise
+    } finally {
+      prewarmPromise = null
+    }
   }
 
   async function ensureTileProtocolRegistered() {
@@ -1020,5 +1292,6 @@ export function useDuckDB() {
     setTileQuery,
     setViewportZoom,
     setViewportCenter,
+    prewarmLodCaches,
   }
 }

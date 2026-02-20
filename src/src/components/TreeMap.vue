@@ -19,6 +19,7 @@ const mapContainer = ref<HTMLDivElement>()
 const zoomLevel = ref(13)
 const mapError = ref<string | null>(null)
 const defaultQueryLoading = ref(true)
+const introActive = ref(true)
 let map: maplibregl.Map | null = null
 let mapInitStartedAt = 0
 let mapQueryChangedAt = 0
@@ -26,13 +27,92 @@ let firstTreesSourceLoadedLogged = false
 let firstMapIdleAfterPublishLogged = false
 let treeInteractionsBound = false
 let lastIconDebugAt = 0
+let prewarmStartedForRevision = -1
+let introStarted = false
+let introRafId: number | null = null
 
-const { query: duckQuery, ensureTileProtocolRegistered, setTileQuery, setViewportZoom, setViewportCenter } = useDuckDB()
+const {
+  query: duckQuery,
+  ensureTileProtocolRegistered,
+  setTileQuery,
+  setViewportZoom,
+  setViewportCenter,
+  prewarmLodCaches,
+} = useDuckDB()
 const { categoryIcons, loading, error, getSpeciesEnrichment } = useTreeData()
 const { target: flyToTarget } = useFlyTo()
 const { currentMapQuery, mapQueryRevision, publishMapQuery } = useMapData()
 const displayError = computed(() => error.value ?? mapError.value)
-const isInitialLoading = computed(() => loading.value || defaultQueryLoading.value)
+const isInitialLoading = computed(() => loading.value || defaultQueryLoading.value || introActive.value)
+
+const INTRO_CENTER: [number, number] = [-122.4194, 37.7749]
+const INTRO_START_ZOOM = 19.5
+const INTRO_END_ZOOM = 13.5
+const INTRO_DURATION_MS = 10_000
+
+function setMapInteractions(enabled: boolean) {
+  if (!map) return
+  const action = enabled ? 'enable' : 'disable'
+  map.boxZoom[action]()
+  map.doubleClickZoom[action]()
+  map.dragPan[action]()
+  map.dragRotate[action]()
+  map.keyboard[action]()
+  map.scrollZoom[action]()
+  map.touchZoomRotate[action]()
+  map.touchPitch[action]()
+}
+
+function runIntroZoomOut() {
+  if (!map || introStarted) return
+  introStarted = true
+  introActive.value = true
+  setMapInteractions(false)
+
+  const startAt = nowMs()
+  const startBearing = map.getBearing()
+  const startPitch = map.getPitch()
+  const baseLng = INTRO_CENTER[0]
+  const baseLat = INTRO_CENTER[1]
+
+  const step = () => {
+    if (!map) return
+    const elapsed = nowMs() - startAt
+    const t = Math.max(0, Math.min(1, elapsed / INTRO_DURATION_MS))
+    const eased = t * t * (3 - 2 * t)
+
+    const zoom = INTRO_START_ZOOM + (INTRO_END_ZOOM - INTRO_START_ZOOM) * eased
+    const bearing = startBearing + 540 * eased
+    const angle = eased * Math.PI * 4
+    const radiusDeg = 0.0015 * (1 - eased)
+    const lng = baseLng + (Math.cos(angle) * radiusDeg) / Math.max(0.2, Math.cos((baseLat * Math.PI) / 180))
+    const lat = baseLat + Math.sin(angle) * radiusDeg
+
+    map.jumpTo({
+      center: [lng, lat],
+      zoom,
+      bearing,
+      pitch: startPitch,
+    })
+
+    if (t < 1) {
+      introRafId = requestAnimationFrame(step)
+      return
+    }
+
+    map.jumpTo({
+      center: INTRO_CENTER,
+      zoom: INTRO_END_ZOOM,
+      bearing,
+      pitch: startPitch,
+    })
+    introRafId = null
+    introActive.value = false
+    setMapInteractions(true)
+  }
+
+  introRafId = requestAnimationFrame(step)
+}
 
 const DEFAULT_MAP_QUERY = `
 SELECT
@@ -332,13 +412,16 @@ onMounted(() => {
         },
       ],
     },
-    center: [-122.44, 37.76],
-    zoom: 13,
+    zoom: INTRO_START_ZOOM,
+    center: INTRO_CENTER,
     pitch: 60,
     bearing: -20,
     maxPitch: 70,
+    maxZoom: INTRO_START_ZOOM,
     keyboard: true,
   })
+
+  setMapInteractions(false)
 
   map.addControl(new maplibregl.NavigationControl(), 'top-right')
   map.on('zoom', updateZoomLevel)
@@ -367,6 +450,15 @@ onMounted(() => {
           msSincePublish: Math.round(nowMs() - mapQueryChangedAt),
           isSourceLoaded: e.isSourceLoaded,
         })
+
+        if (prewarmStartedForRevision !== mapQueryRevision.value) {
+          prewarmStartedForRevision = mapQueryRevision.value
+          void prewarmLodCaches().catch((err) => {
+            console.warn('[Perf] map:prewarm:failed', err)
+          })
+        }
+
+        runIntroZoomOut()
       }
       if (e.sourceId === 'carto-dark' && e.isSourceLoaded) {
         console.info('[Perf] map:basemap-source:loaded', {
@@ -456,6 +548,7 @@ watch(flyToTarget, (t) => {
 })
 
 onUnmounted(() => {
+  if (introRafId != null) cancelAnimationFrame(introRafId)
   map?.remove()
   map = null
 })
