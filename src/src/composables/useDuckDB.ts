@@ -25,8 +25,14 @@ CREATE TABLE IF NOT EXISTS trees (
 
 let initPromise: Promise<void> | null = null
 
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now()
+}
+
 async function doInit() {
   if (db) return
+  const t0 = nowMs()
+  console.info('[Perf] duckdb:init:start')
 
   const bundles: duckdb.DuckDBBundles = {
     mvp: {
@@ -44,22 +50,31 @@ async function doInit() {
   const worker = new Worker(bundle.mainWorker!)
   db = new duckdb.AsyncDuckDB(logger, worker)
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker)
+  console.info('[Perf] duckdb:instantiate:done', { ms: Math.round(nowMs() - t0) })
 
   conn = await db.connect()
   await conn.query(TABLE_DDL)
+  const tAfterSchema = nowMs()
+  console.info('[Perf] duckdb:schema:done', { ms: Math.round(tAfterSchema - t0) })
 
   // Fetch tree JSON and register in DuckDB virtual filesystem
   const res = await fetch(import.meta.env.BASE_URL + 'data/raw_data.json')
   const jsonText = await res.text()
+  console.info('[Perf] duckdb:json:fetched', {
+    ms: Math.round(nowMs() - tAfterSchema),
+    bytes: jsonText.length,
+  })
   await db.registerFileText('trees.json', jsonText)
 
   await conn.query(`INSERT INTO trees SELECT * FROM read_json_auto('trees.json')`)
+  console.info('[Perf] duckdb:insert:done', { ms: Math.round(nowMs() - tAfterSchema) })
 
   ready.value = true
+  console.info('[Perf] duckdb:init:done', { ms: Math.round(nowMs() - t0) })
 }
 
 export function useDuckDB() {
-  // Ensure init runs only once
+  // Initialize eagerly (single shared promise)
   if (!initPromise) {
     initPromise = doInit().catch((e) => {
       initError.value = (e as Error).message
@@ -67,8 +82,12 @@ export function useDuckDB() {
     })
   }
 
-  async function query(sql: string): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> {
+  async function ensureInit() {
     await initPromise
+  }
+
+  async function query(sql: string): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> {
+    await ensureInit()
     if (!conn) throw new Error('DuckDB not initialized')
 
     const result = await conn.query(sql)
@@ -83,5 +102,5 @@ export function useDuckDB() {
     return { columns, rows }
   }
 
-  return { ready, initError, query }
+  return { ready, initError, query, ensureInit }
 }

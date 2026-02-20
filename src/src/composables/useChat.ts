@@ -281,9 +281,6 @@ export function useChat() {
                 },
                 properties: {
                   id: r.tree_id,
-                  commonName: (r.common_name || '').trim(),
-                  species: r.species || '',
-                  plantDate: r.plant_date || '',
                   dbh: r.diameter_at_breast_height ?? 3,
                   category,
                   color,

@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import type { RawTree, TreeCategory } from '../types'
+import type { TreeCategory } from '../types'
 import { getTreeCategory } from './useTreeCategories'
 
 export interface TreeGeoJSON {
@@ -26,6 +26,14 @@ export interface CategoryIconData {
   rgbaBase64: string
   width: number
   height: number
+}
+
+export interface TreeQueryRow {
+  tree_id: number
+  species: string
+  latitude: number
+  longitude: number
+  diameter_at_breast_height: number | null
 }
 
 // ~1 meter jitter so co-located trees spread slightly without drifting into streets
@@ -85,74 +93,20 @@ function buildCategoryIcons(rows: SpeciesEnrichment[]): CategoryIconData[] {
 }
 
 export function useTreeData() {
-  const geojson = ref<TreeGeoJSON | null>(null)
   const categoryIcons = ref<CategoryIconData[]>([])
+  const speciesLookup = ref<Map<string, SpeciesEnrichment>>(new Map())
   const loading = ref(true)
   const error = ref<string | null>(null)
 
   async function load() {
     try {
-      const [rawRes, speciesRes] = await Promise.all([
-        fetch(import.meta.env.BASE_URL + 'data/raw_data.json'),
-        fetch(import.meta.env.BASE_URL + 'data/species_data.json').catch(() => null),
-      ])
-      if (!rawRes.ok) throw new Error(`Failed to fetch tree data: ${rawRes.status}`)
-      const raw: RawTree[] = await rawRes.json()
+      const speciesRes = await fetch(import.meta.env.BASE_URL + 'data/species_data.json').catch(() => null)
       let species: SpeciesEnrichment[] = []
       if (speciesRes?.ok) {
         species = await speciesRes.json()
       }
-      const speciesLookup = buildSpeciesLookup(species)
+      speciesLookup.value = buildSpeciesLookup(species)
       categoryIcons.value = buildCategoryIcons(species)
-
-      const valid = raw.filter((t) => t.latitude && t.longitude)
-
-      // Count trees per location to detect co-located groups
-      const locCounts = new Map<string, number>()
-      for (const t of valid) {
-        const key = `${t.latitude},${t.longitude}`
-        locCounts.set(key, (locCounts.get(key) || 0) + 1)
-      }
-
-      const features: GeoJSON.Feature<GeoJSON.Point>[] = valid
-        .map((tree) => {
-          const enrichment = speciesLookup.get(normalizeSpecies(tree.species))
-          const fallback = getTreeCategory(tree.species)
-          const category = enrichment?.tree_category && isTreeCategory(enrichment.tree_category)
-            ? enrichment.tree_category
-            : fallback.category
-          const color = fallback.color
-          const key = `${tree.latitude},${tree.longitude}`
-          const isCoLocated = (locCounts.get(key) || 0) > 1
-          return {
-            type: 'Feature' as const,
-            geometry: {
-              type: 'Point' as const,
-              coordinates: isCoLocated
-                ? [jitterCoord(tree.longitude), jitterCoord(tree.latitude)]
-                : [tree.longitude, tree.latitude],
-            },
-            properties: {
-              id: tree.tree_id,
-              commonName: tree.common_name.trim(),
-              species: tree.species,
-              plantDate: tree.plant_date,
-              dbh: tree.diameter_at_breast_height ?? 3,
-              category,
-              color,
-              nativeStatus: enrichment?.native_status ?? null,
-              isEvergreen: enrichment?.is_evergreen ?? null,
-              matureHeightFt: enrichment?.mature_height_ft ?? null,
-              bloomSeason: enrichment?.bloom_season ?? null,
-              wildlifeValue: enrichment?.wildlife_value ?? null,
-              fireRisk: enrichment?.fire_risk ?? null,
-              rotation: isCoLocated ? randomRotation() : 0,
-              sizeScale: randomSizeScale(),
-            },
-          }
-        })
-
-      geojson.value = { type: 'FeatureCollection', features }
     } catch (e) {
       error.value = (e as Error).message
     } finally {
@@ -160,6 +114,52 @@ export function useTreeData() {
     }
   }
 
+  function buildTreeGeoJSON(rows: TreeQueryRow[]): TreeGeoJSON {
+    const valid = rows.filter((t) => t.latitude && t.longitude)
+
+    const locCounts = new Map<string, number>()
+    for (const t of valid) {
+      const key = `${t.latitude},${t.longitude}`
+      locCounts.set(key, (locCounts.get(key) || 0) + 1)
+    }
+
+    const features: GeoJSON.Feature<GeoJSON.Point>[] = valid.map((tree) => {
+      const enrichment = speciesLookup.value.get(normalizeSpecies(tree.species || ''))
+      const fallback = getTreeCategory(tree.species || '')
+      const category = enrichment?.tree_category && isTreeCategory(enrichment.tree_category)
+        ? enrichment.tree_category
+        : fallback.category
+      const color = fallback.color
+      const key = `${tree.latitude},${tree.longitude}`
+      const isCoLocated = (locCounts.get(key) || 0) > 1
+
+      return {
+        type: 'Feature' as const,
+        geometry: {
+          type: 'Point' as const,
+          coordinates: isCoLocated
+            ? [jitterCoord(tree.longitude), jitterCoord(tree.latitude)]
+            : [tree.longitude, tree.latitude],
+        },
+        properties: {
+          id: tree.tree_id,
+          dbh: tree.diameter_at_breast_height ?? 3,
+          category,
+          color,
+          rotation: isCoLocated ? randomRotation() : 0,
+          sizeScale: randomSizeScale(),
+        },
+      }
+    })
+
+    return { type: 'FeatureCollection', features }
+  }
+
+  function getSpeciesEnrichment(species: string | null | undefined): SpeciesEnrichment | undefined {
+    if (!species) return undefined
+    return speciesLookup.value.get(normalizeSpecies(species))
+  }
+
   load()
-  return { geojson, categoryIcons, loading, error }
+  return { categoryIcons, loading, error, buildTreeGeoJSON, getSpeciesEnrichment }
 }
