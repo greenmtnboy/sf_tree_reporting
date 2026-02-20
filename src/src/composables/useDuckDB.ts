@@ -72,6 +72,7 @@ let queueLastLoggedAt = 0
 let timingLastLoggedAt = 0
 let prewarmDoneRevision = -1
 let prewarmPromise: Promise<void> | null = null
+let autoTileFetchEnabled = true
 const WEB_MERCATOR_MAX = 20037508.342789244
 const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
 
@@ -92,6 +93,8 @@ type QueuedTileRequest = {
   resolve: (tile: Uint8Array) => void
   reject: (error: unknown) => void
 }
+
+type PrefetchStatus = 'executed' | 'deduped' | 'skipped'
 
 const pendingTileQueue: QueuedTileRequest[] = []
 
@@ -200,7 +203,9 @@ function isTileOutsideDataBounds(z: number, x: number, y: number): boolean {
 }
 
 function baseSimplifyGridMetersForZoom(z: number): number {
-  return z <= 10 ? 256 : z <= 12 ? 128 : z <= 13 ? 64 : z <= 14 ? 32 : 0
+  // Keep low-zoom heatmap aggregation consistent across z13/z14 to avoid
+  // visible density jumps between the top two heatmap tiers.
+  return z <= 10 ? 256 : z <= 12 ? 128 : z <= 14 ? 32 : 0
 }
 
 function adaptiveLodForTile(z: number, x: number, y: number): { simplifyGridMeters: number; tileDistance: number | null } {
@@ -431,7 +436,7 @@ async function doInit() {
   console.info('[Perf] duckdb:trees_fast:done', { ms: Math.round(nowMs() - tFastStart) })
 
   hasAggCacheByZoom.clear()
-  for (const z of [13, 14]) {
+  for (const z of [14]) {
     try {
       const resAgg = await fetch(import.meta.env.BASE_URL + `data/cache/agg_z${z}.parquet`)
       if (!resAgg.ok) continue
@@ -1362,15 +1367,15 @@ export function useDuckDB() {
     })
   }
 
-  async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<void> {
+  async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<PrefetchStatus> {
     await ensureInit()
-    if (!conn || !spatialExtensionReady || z < 15) return
+    if (!conn || !spatialExtensionReady || z < 15) return 'skipped'
 
     const range = getVisibleTileRange(z)
-    if (!range) return
+    if (!range) return 'skipped'
 
     const sig = `${tileQueryRevision}:${z}:${range.minX}-${range.maxX}:${range.minY}-${range.maxY}`
-    if (prefetchedVisibleRangeSigByZoom.get(z) === sig) return
+    if (prefetchedVisibleRangeSigByZoom.get(z) === sig) return 'deduped'
 
     const baseQuery = sanitizeBaseQuery(tileQuerySql.value)
     if (z === 15) {
@@ -1381,6 +1386,7 @@ export function useDuckDB() {
     const centerY = Math.floor((range.minY + range.maxY) / 2)
     await ensureNeighborhoodBatchTiles(z, centerX, centerY, baseQuery)
     prefetchedVisibleRangeSigByZoom.set(z, sig)
+    return 'executed'
   }
 
   async function prewarmLodCaches(): Promise<void> {
@@ -1428,7 +1434,7 @@ export function useDuckDB() {
 
         // 3) then pull out to coarse aggregated caches
         await ensureZoomBatchTiles(14, baseQuery, 32)
-        await ensureZoomBatchTiles(13, baseQuery, 64)
+        await ensureZoomBatchTiles(13, baseQuery, 32)
       } finally {
         if (tileQueryRevision === rev) {
           prewarmDoneRevision = rev
@@ -1450,10 +1456,21 @@ export function useDuckDB() {
     maplibregl.addProtocol('duckdb', async (params) => {
       const parsed = parseDuckdbTileUrl(params.url)
       if (!parsed) return { data: new Uint8Array() }
+
+      if (!autoTileFetchEnabled) {
+        const cached = getCachedTile(tileCacheKey(parsed.z, parsed.x, parsed.y))
+        if (cached) return { data: cached }
+        return { data: new Uint8Array() }
+      }
+
       const tile = await queueTileRequest(parsed.z, parsed.x, parsed.y)
       return { data: tile }
     })
     protocolRegistered = true
+  }
+
+  function setAutoTileFetchEnabled(enabled: boolean) {
+    autoTileFetchEnabled = !!enabled
   }
 
   async function query(sql: string): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> {
@@ -1484,5 +1501,6 @@ export function useDuckDB() {
     setVisibleTileRange,
     prefetchVisibleDetailTilesAtZoom,
     prewarmLodCaches,
+    setAutoTileFetchEnabled,
   }
 }

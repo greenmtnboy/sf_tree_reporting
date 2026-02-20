@@ -31,7 +31,9 @@ let prewarmStartedForRevision = -1
 let introStarted = false
 let introRafId: number | null = null
 let introCancelled = false
-let lastVisibleRangeSig = ''
+let activeTreePopup: maplibregl.Popup | null = null
+let popupRequestToken = 0
+const lastVisibleRangeSigByZoom = new Map<number, string>()
 const introLockedRangeByZoom = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>()
 
 const {
@@ -43,6 +45,7 @@ const {
   setVisibleTileRange,
   prefetchVisibleDetailTilesAtZoom,
   prewarmLodCaches,
+  setAutoTileFetchEnabled,
 } = useDuckDB()
 const { categoryIcons, loading, error, getSpeciesEnrichment } = useTreeData()
 const { target: flyToTarget } = useFlyTo()
@@ -56,6 +59,51 @@ const INTRO_END_ZOOM = 13.5
 const INTRO_DURATION_MS = 10_000
 const INTRO_ROTATION_DEG = 240
 const INITIAL_TILE_PREFETCH_SCALE = 3.5
+const TREES_SOURCE_MAXZOOM = 16
+const SCROLL_WHEEL_ZOOM_RATE = 1 / 1800
+const SCROLL_ZOOM_RATE = 1 / 400
+
+type IntroPrefetchStatus = 'executed' | 'deduped' | 'skipped'
+type IntroPrefetchCounters = { requested: number; executed: number; deduped: number; skipped: number }
+
+const introPrefetchStatsByZoom = new Map<number, IntroPrefetchCounters>()
+
+function resetIntroPrefetchStats() {
+  introPrefetchStatsByZoom.clear()
+}
+
+function recordIntroPrefetchStatus(z: number, status: IntroPrefetchStatus) {
+  const current = introPrefetchStatsByZoom.get(z) ?? {
+    requested: 0,
+    executed: 0,
+    deduped: 0,
+    skipped: 0,
+  }
+  current.requested += 1
+  if (status === 'executed') current.executed += 1
+  else if (status === 'deduped') current.deduped += 1
+  else current.skipped += 1
+  introPrefetchStatsByZoom.set(z, current)
+}
+
+function logIntroPrefetchSummary() {
+  const rows = Array.from(introPrefetchStatsByZoom.entries())
+    .sort((a, b) => b[0] - a[0])
+    .map(([z, s]) => ({ z, ...s }))
+
+  const totals = rows.reduce(
+    (acc, row) => {
+      acc.requested += row.requested
+      acc.executed += row.executed
+      acc.deduped += row.deduped
+      acc.skipped += row.skipped
+      return acc
+    },
+    { requested: 0, executed: 0, deduped: 0, skipped: 0 },
+  )
+
+  console.info('[Perf] map:intro-prefetch-summary', { totals, byZoom: rows })
+}
 
 function setMapInteractions(enabled: boolean) {
   if (!map) return
@@ -148,6 +196,8 @@ async function runIntroZoomOut() {
   introStarted = true
   introCancelled = false
   introActive.value = true
+  resetIntroPrefetchStats()
+  setAutoTileFetchEnabled(false)
   setMapInteractions(false)
 
   const startBearing = map.getBearing()
@@ -173,12 +223,14 @@ async function runIntroZoomOut() {
 
       const stageZoom = Math.round(checkpoints[i + 1])
       if (stageZoom >= 15) {
-        await prefetchVisibleDetailTilesAtZoom(stageZoom)
+        const status = await prefetchVisibleDetailTilesAtZoom(stageZoom)
+        recordIntroPrefetchStatus(stageZoom, status)
       }
 
       await waitForTreesMilestone(2500)
     }
   } finally {
+    setAutoTileFetchEnabled(true)
     if (map) {
       map.jumpTo({
         center: INTRO_CENTER,
@@ -186,9 +238,13 @@ async function runIntroZoomOut() {
         bearing: startBearing + INTRO_ROTATION_DEG,
         pitch: startPitch,
       })
+
+      // Force a fresh tile request pass now that automatic fetch is re-enabled.
+      addTreeLayers()
     }
     introActive.value = false
     introLockedRangeByZoom.clear()
+    logIntroPrefetchSummary()
     setMapInteractions(true)
   }
 }
@@ -268,6 +324,41 @@ function buildIconExpression(): maplibregl.ExpressionSpecification {
   return expr as maplibregl.ExpressionSpecification
 }
 
+function buildSqrtDbhExpression(minValue: number, maxValue: number): maplibregl.ExpressionSpecification {
+  const maxDbh = 42
+  const sqrtMaxDbh = Math.sqrt(maxDbh)
+  return [
+    'interpolate',
+    ['linear'],
+    ['sqrt', ['coalesce', ['to-number', ['get', 'dbh']], 3]],
+    0,
+    minValue,
+    sqrtMaxDbh,
+    maxValue,
+  ] as maplibregl.ExpressionSpecification
+}
+
+function buildCircleRadiusExpression(): maplibregl.ExpressionSpecification {
+  return [
+    'interpolate', ['linear'], ['zoom'],
+    12.8, buildSqrtDbhExpression(0.7, 1.9),
+    15, buildSqrtDbhExpression(1.8, 4.8),
+    18, buildSqrtDbhExpression(2.8, 8.6),
+    20, buildSqrtDbhExpression(3.4, 10.8),
+  ] as maplibregl.ExpressionSpecification
+}
+
+function buildIconSizeExpression(): maplibregl.ExpressionSpecification {
+  return [
+    'interpolate', ['linear'], ['zoom'],
+    // Match apparent size with circle layer around z15 to avoid pop.
+    14.4, buildSqrtDbhExpression(0.04, 0.1),
+    15, buildSqrtDbhExpression(0.055, 0.15),
+    18, buildSqrtDbhExpression(0.2, 0.72),
+    20, buildSqrtDbhExpression(0.28, 1.0),
+  ] as maplibregl.ExpressionSpecification
+}
+
 function formatPopupHtml(row: any, enrichment?: ReturnType<typeof getSpeciesEnrichment>): string {
   const planted = row.plant_date?.split(' ')[0] ?? null
   const evergreen = enrichment?.is_evergreen == null ? null : (enrichment.is_evergreen ? 'Yes' : 'No')
@@ -304,12 +395,15 @@ async function loadDefaultMapData() {
   firstTreesSourceLoadedLogged = false
   firstMapIdleAfterPublishLogged = false
   defaultQueryLoading.value = true
+  lastVisibleRangeSigByZoom.clear()
+  introLockedRangeByZoom.clear()
   setTileQuery(currentMapQuery.value)
   addTreeLayers()
 }
 
 async function showTreePopup(feature: GeoJSON.Feature, offset: number) {
   if (!map) return
+  const requestToken = ++popupRequestToken
   const coords = (feature.geometry as GeoJSON.Point).coordinates.slice() as [number, number]
   const id = Number(feature.properties?.id)
   if (!Number.isFinite(id) || id <= 0) return
@@ -323,12 +417,23 @@ async function showTreePopup(feature: GeoJSON.Feature, offset: number) {
     `)
     const row = rows[0] as any
     if (!row) return
+    if (requestToken !== popupRequestToken) return
     const enrichment = getSpeciesEnrichment(row.species)
 
-    new maplibregl.Popup({ offset, className: 'tree-popup' })
+    if (activeTreePopup) {
+      activeTreePopup.remove()
+      activeTreePopup = null
+    }
+
+    const popup = new maplibregl.Popup({ offset, className: 'tree-popup' })
       .setLngLat(coords)
       .setHTML(formatPopupHtml(row, enrichment))
       .addTo(map)
+
+    activeTreePopup = popup
+    popup.on('close', () => {
+      if (activeTreePopup === popup) activeTreePopup = null
+    })
   } catch (e) {
     console.error('[Popup Query Error]', e)
   }
@@ -338,6 +443,28 @@ function addTreeLayers() {
   if (!map) return
   const t0 = nowMs()
   console.info('[Perf] map:layers:add:start')
+  const treeTiles = [`duckdb://trees/{z}/{x}/{y}.pbf?r=${mapQueryRevision.value}`]
+
+  const existingSource = map.getSource('trees') as any
+  const hasHeatLayer = !!map.getLayer('trees-heat')
+  const hasCircleLayer = !!map.getLayer('trees-circle')
+  const hasIconLayer = !!map.getLayer('trees-icon')
+
+  // Prefer in-place source URL refresh to avoid tearing down layers, which can
+  // cause visible pop during LOD transitions and query revision updates.
+  if (existingSource && hasHeatLayer && hasCircleLayer && hasIconLayer) {
+    if (typeof existingSource.setTiles === 'function') {
+      existingSource.setTiles(treeTiles)
+      if (typeof existingSource.reload === 'function') {
+        existingSource.reload()
+      }
+      console.info('[Perf] map:layers:source-refresh', {
+        ms: Math.round(nowMs() - t0),
+        revision: mapQueryRevision.value,
+      })
+      return
+    }
+  }
 
   if (map.getLayer('trees-icon')) map.removeLayer('trees-icon')
   if (map.getLayer('trees-circle')) map.removeLayer('trees-circle')
@@ -346,9 +473,11 @@ function addTreeLayers() {
 
   map.addSource('trees', {
     type: 'vector',
-    tiles: [`duckdb://trees/{z}/{x}/{y}.pbf?r=${mapQueryRevision.value}`],
+    tiles: treeTiles,
     minzoom: 0,
-    maxzoom: 22,
+    // Pin detailed requests at z16 and let MapLibre overzoom above that.
+    // This reduces query churn/pop when moving through z17+.
+    maxzoom: TREES_SOURCE_MAXZOOM,
   })
 
   // Layer 1: Heatmap at far zoom
@@ -357,23 +486,23 @@ function addTreeLayers() {
     type: 'heatmap',
     source: 'trees',
     'source-layer': 'trees',
-    maxzoom: 15,
+    maxzoom: 15.6,
     paint: {
-      'heatmap-weight': ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.1, 30, 1],
-      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 15, 1.5],
-      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 8, 15, 20],
+      'heatmap-weight': ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.2, 30, 1.15],
+      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.85, 13, 1.2, 15, 1.9],
+      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 10, 13, 14, 15, 22],
       'heatmap-color': [
         'interpolate',
         ['linear'],
         ['heatmap-density'],
         0, 'rgba(0,0,0,0)',
-        0.2, '#1a237e',
-        0.4, '#0f3460',
-        0.6, '#2E7D32',
-        0.8, '#4CAF50',
+        0.15, '#1a237e',
+        0.35, '#0f3460',
+        0.55, '#2E7D32',
+        0.75, '#4CAF50',
         1, '#8BC34A',
       ],
-      'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 13, 0.9, 15, 0],
+      'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 13, 1.0, 14.8, 0.62, 15.6, 0],
     },
   })
 
@@ -383,23 +512,23 @@ function addTreeLayers() {
     type: 'circle',
     source: 'trees',
     'source-layer': 'trees',
-    minzoom: 13.1,
-    maxzoom: 18,
+    minzoom: 12.8,
+    maxzoom: 18.6,
     paint: {
       'circle-radius': [
-        'interpolate', ['linear'], ['zoom'],
-        13.1, 2,
-        16, ['interpolate', ['linear'], ['get', 'dbh'], 0, 3, 30, 8],
-        18, ['interpolate', ['linear'], ['get', 'dbh'], 0, 4, 30, 10],
+        ...buildCircleRadiusExpression(),
       ],
       'circle-color': buildColorExpression(),
       'circle-opacity': [
         'interpolate', ['linear'], ['zoom'],
-        13.1, 0,
-        14, 0.8,
-        16.5, 0.65,
-        18, 0,
+        12.8, 0,
+        13.6, 0.86,
+        15, 0.8,
+        16.8, 0.66,
+        18.6, 0,
       ],
+      'circle-pitch-alignment': 'map',
+      'circle-pitch-scale': 'map',
       'circle-stroke-width': 0.5,
       'circle-stroke-color': 'rgba(255,255,255,0.3)',
     },
@@ -411,35 +540,35 @@ function addTreeLayers() {
     type: 'symbol',
     source: 'trees',
     'source-layer': 'trees',
-    minzoom: 15,
+    minzoom: 14.4,
     layout: {
       'icon-image': buildIconExpression(),
       'icon-size': [
-        'interpolate', ['linear'], ['zoom'],
-        15, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.25, 30, 0.5],
-        18, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.4, 30, 0.9],
-        20, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.5, 30, 1.2],
+        ...buildIconSizeExpression(),
       ],
       'icon-rotate': ['get', 'rotation'],
       'icon-rotation-alignment': 'viewport',
+      'icon-pitch-alignment': 'viewport',
       'icon-allow-overlap': true,
       'icon-ignore-placement': true,
     },
     paint: {
-      'icon-opacity': ['interpolate', ['linear'], ['zoom'], 15, 0, 15.5, 1],
+      'icon-opacity': ['interpolate', ['linear'], ['zoom'], 14.4, 0, 15, 0.72, 15.8, 1],
     },
   })
 
   if (!treeInteractionsBound) {
-    // Click popup
-    map.on('click', 'trees-icon', (e) => {
-      if (!e.features?.length) return
-      void showTreePopup(e.features[0] as unknown as GeoJSON.Feature, 15)
-    })
+    // Single click handler for both tree layers to avoid duplicate popups when
+    // icon + circle overlap for the same feature.
+    map.on('click', (e) => {
+      if (!map) return
+      const features = map.queryRenderedFeatures(e.point, { layers: ['trees-icon', 'trees-circle'] })
+      if (!features.length) return
 
-    map.on('click', 'trees-circle', (e) => {
-      if (!e.features?.length) return
-      void showTreePopup(e.features[0] as unknown as GeoJSON.Feature, 8)
+      const iconFeature = features.find((f) => f.layer?.id === 'trees-icon')
+      const picked = (iconFeature ?? features[0]) as unknown as GeoJSON.Feature
+      const offset = (iconFeature ?? features[0]).layer?.id === 'trees-icon' ? 15 : 8
+      void showTreePopup(picked, offset)
     })
 
     // Cursor style
@@ -459,13 +588,13 @@ function updateZoomLevel() {
   const c = map.getCenter()
   setViewportCenter(c.lng, c.lat)
 
-  const z = Math.round(map.getZoom())
-  if (z >= 13 && z <= 20) {
+  const bounds = map.getBounds()
+  const clampLat = (lat: number) => Math.max(-85.05112878, Math.min(85.05112878, lat))
+  const computeRangeForZoom = (z: number) => {
     const n = Math.pow(2, z)
-    const bounds = map.getBounds()
     const lonToTileX = (lon: number) => Math.floor(((lon + 180) / 360) * n)
     const latToTileY = (lat: number) => {
-      const latRad = (Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI) / 180
+      const latRad = (clampLat(lat) * Math.PI) / 180
       return Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n)
     }
 
@@ -499,15 +628,49 @@ function updateZoomLevel() {
       maxY = Math.min(n - 1, maxY + extraY)
     }
 
-    const rangeSig = `${z}:${minX}-${maxX}:${minY}-${maxY}`
-    if (rangeSig !== lastVisibleRangeSig) {
-      lastVisibleRangeSig = rangeSig
-      setVisibleTileRange(z, minX, maxX, minY, maxY)
+    return { minX, maxX, minY, maxY }
+  }
+
+  const z = Math.round(map.getZoom())
+  if (z >= 13 && z <= 20) {
+    const candidateZooms = new Set<number>([z])
+    if (introActive.value && z >= 15) {
+      // Intro path is a zoom-out, so prefetch current + next-coarser detailed
+      // LOD only. Avoid warming finer zooms (z+1) which adds extra queries
+      // (e.g. z20) without improving visible continuity.
+      candidateZooms.add(Math.max(15, z - 1))
     }
 
-    if (isInitialLoading.value) {
-      const tilesVisible = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1))
-      logIconLayerDebug('initial-visible-tiles', { z, minX, maxX, minY, maxY, tilesVisible })
+    for (const targetZoom of candidateZooms) {
+      if (targetZoom < 13 || targetZoom > 20) continue
+      const { minX, maxX, minY, maxY } = computeRangeForZoom(targetZoom)
+      const rangeSig = `${targetZoom}:${minX}-${maxX}:${minY}-${maxY}`
+      if (rangeSig !== lastVisibleRangeSigByZoom.get(targetZoom)) {
+        lastVisibleRangeSigByZoom.set(targetZoom, rangeSig)
+        setVisibleTileRange(targetZoom, minX, maxX, minY, maxY)
+
+        if (introActive.value && targetZoom >= 15) {
+          void prefetchVisibleDetailTilesAtZoom(targetZoom)
+            .then((status) => {
+              recordIntroPrefetchStatus(targetZoom, status)
+            })
+            .catch((err) => {
+              console.warn('[Perf] map:intro-prefetch:failed', { z: targetZoom, err })
+            })
+        }
+      }
+
+      if (targetZoom === z && isInitialLoading.value) {
+        const tilesVisible = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1))
+        logIconLayerDebug('initial-visible-tiles', {
+          z: targetZoom,
+          minX,
+          maxX,
+          minY,
+          maxY,
+          tilesVisible,
+        })
+      }
     }
   }
 
@@ -519,36 +682,8 @@ onMounted(() => {
   console.info('[Perf] map:init:start')
   map = new maplibregl.Map({
     container: mapContainer.value!,
-    style: {
-      version: 8,
-      glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
-      sources: {
-        'carto-dark': {
-          type: 'raster',
-          tiles: [
-            'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-            'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-            'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-          ],
-          // Use larger raster tiles to reduce base-layer tile churn/pop-in.
-          tileSize: 512,
-          attribution: '&copy; <a href="https://carto.com/">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
-        },
-      },
-      layers: [
-        {
-          id: 'carto-dark-layer',
-          type: 'raster',
-          source: 'carto-dark',
-          minzoom: 0,
-          maxzoom: 20,
-          paint: {
-            'raster-resampling': 'linear',
-            'raster-fade-duration': 150,
-          },
-        },
-      ],
-    },
+    // Dark vector basemap (keeps vector rendering while matching prior dark theme).
+    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
     zoom: INTRO_START_ZOOM,
     center: INTRO_CENTER,
     pitch: 60,
@@ -559,6 +694,14 @@ onMounted(() => {
   })
 
   setMapInteractions(false)
+
+  // Reduce scroll zoom sensitivity for smoother manual zooming.
+  try {
+    ;(map.scrollZoom as any).setWheelZoomRate?.(SCROLL_WHEEL_ZOOM_RATE)
+    ;(map.scrollZoom as any).setZoomRate?.(SCROLL_ZOOM_RATE)
+  } catch {
+    // no-op
+  }
 
   map.addControl(new maplibregl.NavigationControl(), 'top-right')
   map.on('zoom', updateZoomLevel)
@@ -643,6 +786,8 @@ watch([currentMapQuery, mapQueryRevision], ([query]) => {
   firstTreesSourceLoadedLogged = false
   firstMapIdleAfterPublishLogged = false
   defaultQueryLoading.value = true
+  lastVisibleRangeSigByZoom.clear()
+  introLockedRangeByZoom.clear()
   setTileQuery(query)
   addTreeLayers()
 })
@@ -687,6 +832,10 @@ watch(flyToTarget, (t) => {
 onUnmounted(() => {
   introCancelled = true
   if (introRafId != null) cancelAnimationFrame(introRafId)
+  if (activeTreePopup) {
+    activeTreePopup.remove()
+    activeTreePopup = null
+  }
   map?.remove()
   map = null
 })
