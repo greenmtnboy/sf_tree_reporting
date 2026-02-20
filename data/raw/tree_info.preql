@@ -1,14 +1,14 @@
 import std.geography;
 
 key tree_id int; # unique identifier for the tree record
-property tree_id.q_legal_status string; # legal/administrative status of the tree
+property tree_id.legal_status string; # legal/administrative status of the tree
 key species string; # scientific and common species name
-property tree_id.q_address string; # address where the tree is planted
+property tree_id.address string; # address where the tree is planted
 property tree_id.site_order string; # internal ordering for site location
-property tree_id.q_site_info string; # contextual site attributes (e.g., median, sidewalk)
+property tree_id.site_info string; # contextual site attributes (e.g., median, sidewalk)
 property tree_id.plant_type string; # type of planting (e.g., Tree vs. other flora)
-property tree_id.q_caretaker string; # entity responsible for tree maintenance
-property tree_id.q_care_assistant string; # secondary caretaker (if any)
+property tree_id.caretaker string; # entity responsible for tree maintenance
+property tree_id.care_assistant string; # secondary caretaker (if any)
 property tree_id.plant_date string; # date the tree was planted
 property tree_id.diameter_at_breast_height int; # diameter at breast height - standard forestry measure of tree diameter at about 4.5 feet above ground
 property tree_id.plot_size string; # plot area where the tree sits
@@ -27,14 +27,14 @@ property species.species_is_enriched bool; # whether the species has been enrich
 
 root datasource raw_tree_info (
     TreeID: tree_id,
-    qLegalStatus: ?q_legal_status,
+    qLegalStatus: ?legal_status,
     qSpecies: species,
-    qAddress: ?q_address,
+    qAddress: ?address,
     SiteOrder: ?site_order,
-    qSiteInfo: q_site_info,
+    qSiteInfo: site_info,
     PlantType: plant_type,
-    qCaretaker: q_caretaker,
-    qCareAssistant: ?q_care_assistant,
+    qCaretaker: caretaker,
+    qCareAssistant: ?care_assistant,
     PlantDate: ?plant_date,
     DBH: ?diameter_at_breast_height,
     PlotSize: ?plot_size,
@@ -53,14 +53,14 @@ freshness by data_updated_through;
 
 datasource tree_info (
     tree_id,
-    ?q_legal_status,
+    ?legal_status,
     species,
-    ?q_address,
+    ?address,
     ?site_order,
-    q_site_info,
+    site_info,
     plant_type,
-    q_caretaker,
-    ?q_care_assistant,
+    caretaker,
+    ?care_assistant,
     ?plant_date,
     ?diameter_at_breast_height,
     ?plot_size,
@@ -76,3 +76,70 @@ grain (tree_id)
 file `https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_info.parquet`:`gcs://trilogy_public_models/duckdb/sf_trees/tree_info.parquet`
 freshness by data_updated_through;
 
+
+# Enrichment properties hanging off the species key
+property species.common_names string;           # comma-separated common names, most familiar first
+property species.native_status string;          # native_bay_area | native_california | non_native | naturalized | unknown
+property species.is_evergreen bool;
+property species.mature_height_ft float;
+property species.canopy_spread_ft float;
+property species.growth_rate string;            # slow | moderate | fast
+property species.lifespan_years string;         # e.g. "50-100", "200+"
+property species.drought_tolerance string;      # low | moderate | high
+property species.bloom_season string;
+property species.wildlife_value string;         # low | moderate | high
+property species.fire_risk string;              # low | moderate | high
+property species.tree_category string;          # palm | broadleaf | spreading | coniferous | columnar | ornamental | default
+property species.icon_rgba_b64 string;          # raw RGBA bytes, base64-encoded, 48x48px
+property species.icon_width int;
+property species.icon_height int;
+property species.enriched_at datetime;
+
+# Root datasource: runs the Python script to fetch and enrich new species.
+# Emits the full merged table (existing + newly enriched rows).
+root datasource raw_tree_enrichment (
+    species,
+    common_names,
+    native_status,
+    ?is_evergreen,
+    ?mature_height_ft,
+    ?canopy_spread_ft,
+    ?growth_rate,
+    ?lifespan_years,
+    ?drought_tolerance,
+    ?bloom_season,
+    ?wildlife_value,
+    ?fire_risk,
+    tree_category,
+    icon_rgba_b64,
+    icon_width,
+    icon_height,
+    enriched_at,
+)
+grain (species)
+file `./tree_enrichment.py`;
+
+# Cached datasource: reads the persisted parquet written as a side-effect
+# by the script above. Use this for day-to-day queries to avoid re-running.
+datasource tree_enrichment (
+    species,
+    common_names,
+    native_status,
+    ?is_evergreen,
+    ?mature_height_ft,
+    ?canopy_spread_ft,
+    ?growth_rate,
+    ?lifespan_years,
+    ?drought_tolerance,
+    ?bloom_season,
+    ?wildlife_value,
+    ?fire_risk,
+    tree_category,
+    icon_rgba_b64,
+    icon_width,
+    icon_height,
+    enriched_at,
+)
+grain (species)
+file `./tree_enrichment.parquet`
+freshness by enriched_at;

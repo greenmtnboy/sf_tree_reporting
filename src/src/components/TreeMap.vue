@@ -16,7 +16,7 @@ import type { TreeCategory } from '../types'
 const mapContainer = ref<HTMLDivElement>()
 let map: maplibregl.Map | null = null
 
-const { geojson, loading, error } = useTreeData()
+const { geojson, categoryIcons, loading, error } = useTreeData()
 const { target: flyToTarget } = useFlyTo()
 const { currentGeoJSON, publishGeoJSON } = useMapData()
 
@@ -40,12 +40,40 @@ function buildIconExpression(): maplibregl.ExpressionSpecification {
   return expr as maplibregl.ExpressionSpecification
 }
 
+function formatPopupHtml(p: any): string {
+  const planted = p.plantDate?.split(' ')[0] ?? null
+  const evergreen = p.isEvergreen == null ? null : (p.isEvergreen ? 'Yes' : 'No')
+  const detailLines = [
+    ['ID', p.id],
+    ['Planted', planted],
+    ['DBH', p.dbh != null ? `${p.dbh}\"` : null],
+    ['Native', p.nativeStatus],
+    ['Evergreen', evergreen],
+    ['Mature height', p.matureHeightFt != null ? `${p.matureHeightFt} ft` : null],
+    ['Bloom', p.bloomSeason],
+    ['Wildlife value', p.wildlifeValue],
+    ['Fire risk', p.fireRisk],
+  ]
+    .filter(([, value]) => value != null && value !== '' && value !== 'Unknown')
+    .map(([label, value]) => `${label}: ${value}<br/>`)
+    .join('')
+
+  return `
+    <strong>${p.commonName}</strong><br/>
+    <em>${p.species}</em><br/>
+    ${detailLines}
+  `
+}
+
 function addTreeLayers() {
   if (!map || !currentGeoJSON.value) return
 
   map.addSource('trees', {
     type: 'geojson',
     data: currentGeoJSON.value,
+    cluster: true,
+    clusterMaxZoom: 15,
+    clusterRadius: 64,
   })
 
   // Layer 1: Heatmap at far zoom
@@ -53,11 +81,15 @@ function addTreeLayers() {
     id: 'trees-heat',
     type: 'heatmap',
     source: 'trees',
-    maxzoom: 15,
+    maxzoom: 13,
     paint: {
-      'heatmap-weight': ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.1, 30, 1],
-      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 15, 1.5],
-      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 8, 15, 20],
+      'heatmap-weight': [
+        'coalesce',
+        ['interpolate', ['linear'], ['get', 'point_count'], 1, 0.2, 50, 1],
+        ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.1, 30, 1],
+      ],
+      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 13, 1.1],
+      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 7, 13, 16],
       'heatmap-color': [
         'interpolate',
         ['linear'],
@@ -69,27 +101,78 @@ function addTreeLayers() {
         0.8, '#4CAF50',
         1, '#8BC34A',
       ],
-      'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 13, 0.9, 15, 0],
+      'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 12.5, 0.85, 13, 0],
     },
   })
 
-  // Layer 2: Colored circles at medium zoom
+  // Layer 2: Aggregated clusters at medium zoom
+  map.addLayer({
+    id: 'trees-cluster',
+    type: 'circle',
+    source: 'trees',
+    minzoom: 12,
+    maxzoom: 16,
+    filter: ['has', 'point_count'],
+    paint: {
+      'circle-color': [
+        'step',
+        ['get', 'point_count'],
+        '#2E7D32',
+        20, '#43A047',
+        100, '#66BB6A',
+        300, '#8BC34A',
+      ],
+      'circle-radius': [
+        'step',
+        ['get', 'point_count'],
+        10,
+        20, 14,
+        100, 18,
+        300, 24,
+      ],
+      'circle-opacity': ['interpolate', ['linear'], ['zoom'], 12, 0.75, 16, 0.6],
+      'circle-stroke-width': 1,
+      'circle-stroke-color': 'rgba(255,255,255,0.35)',
+    },
+  })
+
+  map.addLayer({
+    id: 'trees-cluster-count',
+    type: 'symbol',
+    source: 'trees',
+    minzoom: 12,
+    maxzoom: 16,
+    filter: ['has', 'point_count'],
+    layout: {
+      'text-field': ['get', 'point_count_abbreviated'],
+      'text-size': 11,
+      'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
+    },
+    paint: {
+      'text-color': '#E8F5E9',
+      'text-halo-color': 'rgba(0,0,0,0.45)',
+      'text-halo-width': 1,
+    },
+  })
+
+  // Layer 3: Individual colored circles at medium-close zoom
   map.addLayer({
     id: 'trees-circle',
     type: 'circle',
     source: 'trees',
-    minzoom: 13,
+    minzoom: 14,
     maxzoom: 16,
+    filter: ['!', ['has', 'point_count']],
     paint: {
       'circle-radius': [
         'interpolate', ['linear'], ['zoom'],
-        13, 2,
+        14, 2,
         16, ['interpolate', ['linear'], ['get', 'dbh'], 0, 3, 30, 8],
       ],
       'circle-color': buildColorExpression(),
       'circle-opacity': [
         'interpolate', ['linear'], ['zoom'],
-        13, 0,
+        14, 0,
         14, 0.8,
         15.5, 0.8,
         16, 0,
@@ -99,17 +182,18 @@ function addTreeLayers() {
     },
   })
 
-  // Layer 3: Tree icons at close zoom
+  // Layer 4: Tree icons at close zoom
   map.addLayer({
     id: 'trees-icon',
     type: 'symbol',
     source: 'trees',
-    minzoom: 15,
+    minzoom: 16,
+    filter: ['!', ['has', 'point_count']],
     layout: {
       'icon-image': buildIconExpression(),
       'icon-size': [
         'interpolate', ['linear'], ['zoom'],
-        15, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.25, 30, 0.5],
+        16, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.25, 30, 0.5],
         18, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.4, 30, 0.9],
         20, ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.5, 30, 1.2],
       ],
@@ -119,8 +203,22 @@ function addTreeLayers() {
       'icon-ignore-placement': true,
     },
     paint: {
-      'icon-opacity': ['interpolate', ['linear'], ['zoom'], 15, 0, 15.5, 1],
+      'icon-opacity': ['interpolate', ['linear'], ['zoom'], 16, 0, 16.5, 1],
     },
+  })
+
+  map.on('click', 'trees-cluster', (e) => {
+    if (!e.features?.length) return
+    const feature = e.features[0]
+    const clusterId = feature.properties?.cluster_id
+    if (clusterId == null) return
+    const source = map!.getSource('trees') as maplibregl.GeoJSONSource
+    source.getClusterExpansionZoom(clusterId)
+      .then((zoom) => {
+      const coordinates = (feature.geometry as GeoJSON.Point).coordinates as [number, number]
+      map!.easeTo({ center: coordinates, zoom })
+      })
+      .catch(() => {})
   })
 
   // Click popup
@@ -132,13 +230,7 @@ function addTreeLayers() {
 
     new maplibregl.Popup({ offset: 15, className: 'tree-popup' })
       .setLngLat(coords)
-      .setHTML(`
-        <strong>${p.commonName}</strong><br/>
-        <em>${p.species}</em><br/>
-        ID: ${p.id}<br/>
-        Planted: ${p.plantDate?.split(' ')[0] ?? 'Unknown'}<br/>
-        DBH: ${p.dbh}"
-      `)
+      .setHTML(formatPopupHtml(p))
       .addTo(map!)
   })
 
@@ -150,18 +242,12 @@ function addTreeLayers() {
 
     new maplibregl.Popup({ offset: 8, className: 'tree-popup' })
       .setLngLat(coords)
-      .setHTML(`
-        <strong>${p.commonName}</strong><br/>
-        <em>${p.species}</em><br/>
-        ID: ${p.id}<br/>
-        Planted: ${p.plantDate?.split(' ')[0] ?? 'Unknown'}<br/>
-        DBH: ${p.dbh}"
-      `)
+      .setHTML(formatPopupHtml(p))
       .addTo(map!)
   })
 
   // Cursor style
-  for (const layer of ['trees-icon', 'trees-circle']) {
+  for (const layer of ['trees-icon', 'trees-circle', 'trees-cluster']) {
     map.on('mouseenter', layer, () => { map!.getCanvas().style.cursor = 'pointer' })
     map.on('mouseleave', layer, () => { map!.getCanvas().style.cursor = '' })
   }
@@ -205,11 +291,16 @@ onMounted(() => {
   map.addControl(new maplibregl.NavigationControl(), 'top-right')
 
   map.on('load', () => {
-    registerTreeIcons(map!)
+    registerTreeIcons(map!, categoryIcons.value)
     if (currentGeoJSON.value) {
       addTreeLayers()
     }
   })
+})
+
+watch(categoryIcons, (icons) => {
+  if (!map?.loaded()) return
+  registerTreeIcons(map, icons)
 })
 
 // Seed shared map data when tree data first loads

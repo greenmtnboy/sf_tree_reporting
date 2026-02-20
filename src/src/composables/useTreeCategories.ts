@@ -1,4 +1,5 @@
 import type { TreeCategory } from '../types'
+import type { CategoryIconData } from './useTreeData'
 
 interface CategoryInfo {
   category: TreeCategory
@@ -201,17 +202,48 @@ function drawTreeIcon(category: TreeCategory, size: number): HTMLCanvasElement {
 
 const ALL_CATEGORIES: TreeCategory[] = ['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default']
 
+function decodeBase64ToU8(base64: string): Uint8Array {
+  const bin = atob(base64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i)
+  }
+  return bytes
+}
+
 /** Register all tree icons with a MapLibre map instance */
-export function registerTreeIcons(map: maplibregl.Map, size = 48): void {
+export function registerTreeIcons(map: maplibregl.Map, categoryIcons: CategoryIconData[] = [], size = 48): void {
+  // Prefer enriched, pre-baked RGBA icons when available
+  for (const icon of categoryIcons) {
+    const imageName = `tree-${icon.category}`
+    try {
+      const decoded = decodeBase64ToU8(icon.rgbaBase64)
+      const expectedLen = icon.width * icon.height * 4
+      if (decoded.length !== expectedLen) continue
+      const image = {
+        width: icon.width,
+        height: icon.height,
+        data: decoded,
+      }
+      if (map.hasImage(imageName)) {
+        map.updateImage(imageName, image)
+      } else {
+        map.addImage(imageName, image)
+      }
+    } catch {
+      // Ignore malformed icon rows and fall back to canvas icon below
+    }
+  }
+
+  // Fallback icon generation for any missing category icon
   for (const cat of ALL_CATEGORIES) {
+    if (map.hasImage(`tree-${cat}`)) continue
     const canvas = drawTreeIcon(cat, size)
     const imageData = canvas.getContext('2d')!.getImageData(0, 0, size, size)
-    if (!map.hasImage(`tree-${cat}`)) {
-      map.addImage(`tree-${cat}`, {
-        width: size,
-        height: size,
-        data: new Uint8Array(imageData.data.buffer),
-      })
-    }
+    map.addImage(`tree-${cat}`, {
+      width: size,
+      height: size,
+      data: new Uint8Array(imageData.data.buffer),
+    })
   }
 }

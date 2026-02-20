@@ -18,7 +18,7 @@ An angled flyover-style map of San Francisco's urban forest, rendering tree data
 | 16+ | Tree silhouette icons (category-specific shape, DBH-scaled) | Individual tree identification |
 
 ## Tree Categories
-Trees are categorized by genus (extracted from `q_species` field, first word before `::` separator):
+Trees are categorized by genus (extracted from `species` field, first word before `::` separator):
 
 | Category | Genera | Shape | Color |
 |----------|--------|-------|-------|

@@ -2,6 +2,8 @@ import { ref } from 'vue'
 import * as duckdb from '@duckdb/duckdb-wasm'
 import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url'
 import duckdb_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url'
+import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url'
+import duckdb_worker_eh from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url'
 
 let db: duckdb.AsyncDuckDB | null = null
 let conn: duckdb.AsyncDuckDBConnection | null = null
@@ -12,9 +14,9 @@ const TABLE_DDL = `
 CREATE TABLE IF NOT EXISTS trees (
   tree_id INTEGER,
   common_name VARCHAR,
-  q_site_info VARCHAR,
+  site_info VARCHAR,
   plant_date VARCHAR,
-  q_species VARCHAR,
+  species VARCHAR,
   latitude DOUBLE,
   longitude DOUBLE,
   diameter_at_breast_height DOUBLE
@@ -26,10 +28,22 @@ let initPromise: Promise<void> | null = null
 async function doInit() {
   if (db) return
 
+  const bundles: duckdb.DuckDBBundles = {
+    mvp: {
+      mainModule: duckdb_wasm,
+      mainWorker: duckdb_worker,
+    },
+    eh: {
+      mainModule: duckdb_wasm_eh,
+      mainWorker: duckdb_worker_eh,
+    },
+  }
+  const bundle = await duckdb.selectBundle(bundles)
+
   const logger = new duckdb.ConsoleLogger()
-  const worker = new Worker(duckdb_worker)
+  const worker = new Worker(bundle.mainWorker!)
   db = new duckdb.AsyncDuckDB(logger, worker)
-  await db.instantiate(duckdb_wasm)
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker)
 
   conn = await db.connect()
   await conn.query(TABLE_DDL)

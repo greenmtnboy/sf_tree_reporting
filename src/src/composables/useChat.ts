@@ -7,7 +7,7 @@ import { useLandmarkData } from './useLandmarkData'
 import { useMapData } from './useMapData'
 import { getTreeCategory } from './useTreeCategories'
 import { jitterCoord, randomRotation, randomSizeScale } from './useTreeData'
-import TREES_MODEL from '../../../data/trees_local_model.preql?raw'
+import TREES_MODEL from '../../../data/raw/tree_info.preql?raw'
 
 const API_KEY_STORAGE = 'sf_trees_anthropic_key'
 const MAX_LOOPS = 10
@@ -23,6 +23,32 @@ interface HistoryMsg {
   content: string
   toolCalls?: Array<{ id: string; name: string; input: Record<string, unknown> }>
   toolResults?: Array<{ toolCallId: string; toolName: string; result: string }>
+}
+
+const ALL_CATEGORIES = new Set(['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default'])
+let speciesCategoryLookupPromise: Promise<Map<string, string>> | null = null
+
+function normalizeSpecies(species: string): string {
+  return species.trim().toLowerCase()
+}
+
+function loadSpeciesCategoryLookup(): Promise<Map<string, string>> {
+  if (speciesCategoryLookupPromise) return speciesCategoryLookupPromise
+  speciesCategoryLookupPromise = fetch(import.meta.env.BASE_URL + 'data/species_data.json')
+    .then(async (res) => {
+      if (!res.ok) return new Map<string, string>()
+      const rows = await res.json() as Array<{ species?: string; tree_category?: string | null }>
+      const map = new Map<string, string>()
+      for (const row of rows) {
+        const species = row.species?.trim()
+        const category = row.tree_category?.trim()
+        if (!species || !category || !ALL_CATEGORIES.has(category)) continue
+        map.set(normalizeSpecies(species), category)
+      }
+      return map
+    })
+    .catch(() => new Map<string, string>())
+  return speciesCategoryLookupPromise
 }
 
 const TOOLS = [
@@ -103,9 +129,9 @@ When users ask about trees, write Trilogy/PreQL SELECT queries using the availab
 AVAILABLE CONCEPTS:
 - tree_id (int) — unique identifier
 - common_name (string) — e.g. "Swamp Myrtle"
-- q_site_info (string) — planting site info (e.g. "Sidewalk: Curb side")
+- site_info (string) — planting site info (e.g. "Sidewalk: Curb side")
 - plant_date (string) — date planted, format "MM/DD/YYYY HH:MM:SS AM"
-- q_species (string) — full species string like "Tristaniopsis laurina :: Swamp Myrtle"
+- species (string) — full species string like "Tristaniopsis laurina :: Swamp Myrtle"
 - latitude (float) — geographic latitude
 - longitude (float) — geographic longitude
 - diameter_at_breast_height (float) — trunk diameter in inches
@@ -121,7 +147,7 @@ VALID DATA TYPES: ${datatypes.join(', ')}
 
 IMPORTANT GUIDELINES:
 1. Always use a reasonable LIMIT (e.g., 100–500) unless the user asks for all data
-2. When publishing to the map, always include tree_id, common_name, q_species, latitude, longitude, diameter_at_breast_height, plant_date, and q_site_info so popups have full data
+2. When publishing to the map, always include tree_id, common_name, species, latitude, longitude, diameter_at_breast_height, plant_date, and site_info so popups have full data
 3. If a query fails, explain the error and try a corrected version
 
 Be concise and helpful. When showing query results, format them nicely.`,
@@ -230,6 +256,7 @@ export function useChat() {
           const { query } = input as { query: string }
           const sql = await compilePreQL(query)
           const { rows } = await duckQuery(sql)
+          const speciesCategoryLookup = await loadSpeciesCategoryLookup()
           const validRows = rows.filter((r: any) => r.latitude && r.longitude)
           // Detect co-located trees
           const locCounts = new Map<string, number>()
@@ -239,7 +266,9 @@ export function useChat() {
           }
           const features = validRows
             .map((r: any) => {
-              const { category, color } = getTreeCategory(r.q_species || '')
+              const fallback = getTreeCategory(r.species || '')
+              const category = speciesCategoryLookup.get(normalizeSpecies(r.species || '')) ?? fallback.category
+              const color = fallback.color
               const key = `${r.latitude},${r.longitude}`
               const isCoLocated = (locCounts.get(key) || 0) > 1
               return {
@@ -253,7 +282,7 @@ export function useChat() {
                 properties: {
                   id: r.tree_id,
                   commonName: (r.common_name || '').trim(),
-                  species: r.q_species || '',
+                  species: r.species || '',
                   plantDate: r.plant_date || '',
                   dbh: r.diameter_at_breast_height ?? 3,
                   category,
@@ -306,7 +335,14 @@ export function useChat() {
           return { result: `Unknown tool: ${name}`, isError: true }
       }
     } catch (e) {
-      return { result: `Error: ${(e as Error).message}`, isError: true }
+      const err = e as Error
+      console.error('[Tool Error]', {
+        tool: name,
+        input,
+        message: err.message,
+        stack: err.stack,
+      })
+      return { result: `Error: ${err.message}`, isError: true }
     }
   }
 
@@ -341,6 +377,13 @@ export function useChat() {
         const toolCalls: ToolCallRecord[] = []
         for (const tc of response.toolCalls) {
           const { result, isError } = await executeTool(tc.name, tc.input)
+          if (isError) {
+            console.error('[Tool Error Result]', {
+              tool: tc.name,
+              input: tc.input,
+              result,
+            })
+          }
           toolCalls.push({ id: tc.id, name: tc.name, input: tc.input, result, isError })
         }
 
