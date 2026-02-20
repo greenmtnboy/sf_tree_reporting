@@ -341,10 +341,10 @@ function buildSqrtDbhExpression(minValue: number, maxValue: number): maplibregl.
 function buildCircleRadiusExpression(): maplibregl.ExpressionSpecification {
   return [
     'interpolate', ['linear'], ['zoom'],
-    12.8, buildSqrtDbhExpression(0.7, 1.9),
-    15, buildSqrtDbhExpression(1.8, 4.8),
-    18, buildSqrtDbhExpression(2.8, 8.6),
-    20, buildSqrtDbhExpression(3.4, 10.8),
+    12.8, buildSqrtDbhExpression(0.85, 2.2),
+    15, buildSqrtDbhExpression(2.1, 5.6),
+    18, buildSqrtDbhExpression(3.1, 9.5),
+    20, buildSqrtDbhExpression(3.7, 11.6),
   ] as maplibregl.ExpressionSpecification
 }
 
@@ -488,7 +488,21 @@ function addTreeLayers() {
     'source-layer': 'trees',
     maxzoom: 15.6,
     paint: {
-      'heatmap-weight': ['interpolate', ['linear'], ['get', 'dbh'], 0, 0.2, 30, 1.15],
+      // Normalize count by grid area so heatmap color is consistent across
+      // different aggregation tiers. Reference grid is 32m.
+      'heatmap-weight': [
+        'interpolate',
+        ['linear'],
+        [
+          '*',
+          ['coalesce', ['to-number', ['get', 'point_count']], 1],
+          ['^', ['/', 32, ['coalesce', ['to-number', ['get', 'grid_m']], 32]], 2],
+        ],
+        1, 0.2,
+        8, 0.45,
+        32, 0.75,
+        128, 1.05,
+      ],
       'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.85, 13, 1.2, 15, 1.9],
       'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 10, 13, 14, 15, 22],
       'heatmap-color': [
@@ -522,15 +536,15 @@ function addTreeLayers() {
       'circle-opacity': [
         'interpolate', ['linear'], ['zoom'],
         12.8, 0,
-        13.6, 0.86,
-        15, 0.8,
-        16.8, 0.66,
+        13.6, 0.92,
+        15, 0.88,
+        16.8, 0.74,
         18.6, 0,
       ],
       'circle-pitch-alignment': 'map',
       'circle-pitch-scale': 'map',
-      'circle-stroke-width': 0.5,
-      'circle-stroke-color': 'rgba(255,255,255,0.3)',
+      'circle-stroke-width': 0.65,
+      'circle-stroke-color': 'rgba(255,255,255,0.42)',
     },
   })
 

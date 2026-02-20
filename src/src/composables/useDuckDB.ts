@@ -203,9 +203,9 @@ function isTileOutsideDataBounds(z: number, x: number, y: number): boolean {
 }
 
 function baseSimplifyGridMetersForZoom(z: number): number {
-  // Keep low-zoom heatmap aggregation consistent across z13/z14 to avoid
-  // visible density jumps between the top two heatmap tiers.
-  return z <= 10 ? 256 : z <= 12 ? 128 : z <= 14 ? 32 : 0
+  // Keep heatmap aggregation resolution consistent across low/medium zooms
+  // so color intensity does not jump at zoom boundaries.
+  return z <= 14 ? 32 : 0
 }
 
 function adaptiveLodForTile(z: number, x: number, y: number): { simplifyGridMeters: number; tileDistance: number | null } {
@@ -528,7 +528,9 @@ function zoomBatchKey(rev: number, z: number): string {
 function shouldUseZoomBatch(z: number): boolean {
   // Keep zoom-batch for low/medium LOD aggregated tiers.
   // Detailed tiers (z>=15) are handled by neighborhood batching.
-  return z >= 13 && z <= 14
+  // Including z11/z12 prevents many near-duplicate per-tile aggregated SQL
+  // calls while panning/zooming because one batch fills sibling tiles.
+  return z >= 11 && z <= 14
 }
 
 function neighborhoodBlockSizeForZoom(z: number): number {
@@ -592,7 +594,9 @@ WITH base AS (
       'id': COALESCE(base.tree_id, tf.tree_id, 0),
       'dbh': TRY_CAST(COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS DOUBLE),
       'category': COALESCE(tf.tree_category, 'default'),
-      'rotation': 0
+      'rotation': 0,
+      'point_count': 1,
+      'grid_m': 32
     } AS feature
   FROM base
   INNER JOIN trees_fast tf
@@ -745,7 +749,9 @@ WITH base AS (
       'id': id,
       'dbh': TRY_CAST(dbh AS DOUBLE),
       'category': category,
-      'rotation': rotation
+      'rotation': rotation,
+      'point_count': 1,
+      'grid_m': 32
     } AS feature
   FROM tiled
 )
@@ -955,7 +961,8 @@ WITH agg AS (
       'dbh': TRY_CAST(dbh AS DOUBLE),
       'category': 'default',
       'rotation': 0,
-      'point_count': TRY_CAST(point_count AS INTEGER)
+      'point_count': TRY_CAST(point_count AS INTEGER),
+      'grid_m': ${simplifyGridMeters}
     } AS feature
   FROM agg
 )
@@ -1009,7 +1016,8 @@ WITH base AS (
       'dbh': TRY_CAST(dbh AS DOUBLE),
       'category': 'default',
       'rotation': 0,
-      'point_count': TRY_CAST(point_count AS INTEGER)
+      'point_count': TRY_CAST(point_count AS INTEGER),
+      'grid_m': ${simplifyGridMeters}
     } AS feature
   FROM agg
 )
@@ -1055,7 +1063,9 @@ WITH base AS (
       'id': id,
       'dbh': TRY_CAST(dbh AS DOUBLE),
       'category': category,
-      'rotation': rotation
+      'rotation': rotation,
+      'point_count': 1,
+      'grid_m': 32
     } AS feature
   FROM bounded
 )
@@ -1224,7 +1234,8 @@ WITH base AS (
     'dbh': TRY_CAST(dbh AS DOUBLE),
     'category': 'default',
     'rotation': 0,
-    'point_count': TRY_CAST(point_count AS INTEGER)
+    'point_count': TRY_CAST(point_count AS INTEGER),
+    'grid_m': ${simplifyGridMeters}
   } AS feature
   FROM agg
 )
@@ -1240,6 +1251,8 @@ WITH base AS (
     COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh,
     COALESCE(tf.tree_category, 'default') AS category,
     0 AS rotation,
+    1 AS point_count,
+    32 AS grid_m,
     ST_AsMVTGeom(
       ST_Point(tf.x_3857, tf.y_3857),
       ST_Extent(ST_TileEnvelope(${z}, ${x}, ${y})),
