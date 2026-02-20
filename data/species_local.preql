@@ -1,4 +1,4 @@
-import raw.tree_enrichment;
+import raw.tree_info;
 
 copy into json `./species_data.json` from
 select

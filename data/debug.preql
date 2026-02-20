@@ -1,5 +1,5 @@
 import raw.tree_info;
 
 
-select count_distinct(split(split(q_species, '::')[1], ' ')[1]) as genus_count
+select count_distinct(split(split(species, '::')[1], ' ')[1]) as genus_count
 ;

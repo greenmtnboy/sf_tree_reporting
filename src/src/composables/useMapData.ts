@@ -1,12 +1,13 @@
 import { ref } from 'vue'
-import type { TreeGeoJSON } from './useTreeData'
 
-const currentGeoJSON = ref<TreeGeoJSON | null>(null)
+const currentMapQuery = ref<string | null>(null)
+const mapQueryRevision = ref(0)
 
 export function useMapData() {
-  function publishGeoJSON(data: TreeGeoJSON) {
-    currentGeoJSON.value = data
+  function publishMapQuery(query: string) {
+    currentMapQuery.value = query.trim()
+    mapQueryRevision.value += 1
   }
 
-  return { currentGeoJSON, publishGeoJSON }
+  return { currentMapQuery, mapQueryRevision, publishMapQuery }
 }

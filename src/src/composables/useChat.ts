@@ -5,8 +5,6 @@ import { useDuckDB } from './useDuckDB'
 import { useFlyTo } from './useFlyTo'
 import { useLandmarkData } from './useLandmarkData'
 import { useMapData } from './useMapData'
-import { getTreeCategory } from './useTreeCategories'
-import { jitterCoord, randomRotation, randomSizeScale } from './useTreeData'
 import TREES_MODEL from '../../../data/raw/tree_info.preql?raw'
 
 const API_KEY_STORAGE = 'sf_trees_anthropic_key'
@@ -26,30 +24,6 @@ interface HistoryMsg {
 }
 
 const ALL_CATEGORIES = new Set(['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default'])
-let speciesCategoryLookupPromise: Promise<Map<string, string>> | null = null
-
-function normalizeSpecies(species: string): string {
-  return species.trim().toLowerCase()
-}
-
-function loadSpeciesCategoryLookup(): Promise<Map<string, string>> {
-  if (speciesCategoryLookupPromise) return speciesCategoryLookupPromise
-  speciesCategoryLookupPromise = fetch(import.meta.env.BASE_URL + 'data/species_data.json')
-    .then(async (res) => {
-      if (!res.ok) return new Map<string, string>()
-      const rows = await res.json() as Array<{ species?: string; tree_category?: string | null }>
-      const map = new Map<string, string>()
-      for (const row of rows) {
-        const species = row.species?.trim()
-        const category = row.tree_category?.trim()
-        if (!species || !category || !ALL_CATEGORIES.has(category)) continue
-        map.set(normalizeSpecies(species), category)
-      }
-      return map
-    })
-    .catch(() => new Map<string, string>())
-  return speciesCategoryLookupPromise
-}
 
 const TOOLS = [
   {
@@ -162,7 +136,7 @@ export function useChat() {
   const { query: duckQuery } = useDuckDB()
   const { flyTo } = useFlyTo()
   const { landmarks } = useLandmarkData()
-  const { publishGeoJSON } = useMapData()
+  const { publishMapQuery } = useMapData()
   const trilogy = useTrilogyCore()
 
   // Ensure the Trilogy resolver points at the production service
@@ -255,42 +229,8 @@ export function useChat() {
         case 'publish_results': {
           const { query } = input as { query: string }
           const sql = await compilePreQL(query)
-          const { rows } = await duckQuery(sql)
-          const speciesCategoryLookup = await loadSpeciesCategoryLookup()
-          const validRows = rows.filter((r: any) => r.latitude && r.longitude)
-          // Detect co-located trees
-          const locCounts = new Map<string, number>()
-          for (const r of validRows) {
-            const key = `${(r as any).latitude},${(r as any).longitude}`
-            locCounts.set(key, (locCounts.get(key) || 0) + 1)
-          }
-          const features = validRows
-            .map((r: any) => {
-              const fallback = getTreeCategory(r.species || '')
-              const category = speciesCategoryLookup.get(normalizeSpecies(r.species || '')) ?? fallback.category
-              const color = fallback.color
-              const key = `${r.latitude},${r.longitude}`
-              const isCoLocated = (locCounts.get(key) || 0) > 1
-              return {
-                type: 'Feature' as const,
-                geometry: {
-                  type: 'Point' as const,
-                  coordinates: isCoLocated
-                    ? [jitterCoord(r.longitude), jitterCoord(r.latitude)]
-                    : [r.longitude, r.latitude],
-                },
-                properties: {
-                  id: r.tree_id,
-                  dbh: r.diameter_at_breast_height ?? 3,
-                  category,
-                  color,
-                  rotation: isCoLocated ? randomRotation() : 0,
-                  sizeScale: randomSizeScale(),
-                },
-              }
-            })
-          publishGeoJSON({ type: 'FeatureCollection', features })
-          return { result: `Published ${features.length} trees to the map.`, isError: false }
+          publishMapQuery(sql)
+          return { result: 'Published query to the map.', isError: false }
         }
         case 'navigate': {
           const { latitude, longitude, zoom, locations } = input as {
