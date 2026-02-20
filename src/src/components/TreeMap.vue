@@ -30,6 +30,8 @@ let lastIconDebugAt = 0
 let prewarmStartedForRevision = -1
 let introStarted = false
 let introRafId: number | null = null
+let introCancelled = false
+let lastVisibleRangeSig = ''
 
 const {
   query: duckQuery,
@@ -37,6 +39,7 @@ const {
   setTileQuery,
   setViewportZoom,
   setViewportCenter,
+  setVisibleTileRange,
   prewarmLodCaches,
 } = useDuckDB()
 const { categoryIcons, loading, error, getSpeciesEnrichment } = useTreeData()
@@ -46,9 +49,11 @@ const displayError = computed(() => error.value ?? mapError.value)
 const isInitialLoading = computed(() => loading.value || defaultQueryLoading.value || introActive.value)
 
 const INTRO_CENTER: [number, number] = [-122.4194, 37.7749]
-const INTRO_START_ZOOM = 19.5
+const INTRO_START_ZOOM = 18.5
 const INTRO_END_ZOOM = 13.5
 const INTRO_DURATION_MS = 10_000
+const INTRO_ROTATION_DEG = 240
+const INITIAL_TILE_PREFETCH_SCALE = 3.5
 
 function setMapInteractions(enabled: boolean) {
   if (!map) return
@@ -63,55 +68,120 @@ function setMapInteractions(enabled: boolean) {
   map.touchPitch[action]()
 }
 
-function runIntroZoomOut() {
+async function waitForTreesMilestone(timeoutMs = 2500): Promise<void> {
+  if (!map) return
+  if (map.isSourceLoaded('trees')) return
+
+  await new Promise<void>((resolve) => {
+    if (!map) return resolve()
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      map?.off('sourcedata', onSourceData)
+      clearTimeout(timer)
+      resolve()
+    }
+    const onSourceData = (e: any) => {
+      if (e?.sourceId === 'trees' && e?.isSourceLoaded) finish()
+    }
+    const timer = setTimeout(finish, timeoutMs)
+    map.on('sourcedata', onSourceData)
+  })
+}
+
+function runIntroZoomSegment(
+  fromZoom: number,
+  toZoom: number,
+  fromT: number,
+  toT: number,
+  durationMs: number,
+  startBearing: number,
+  pitch: number,
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (!map) return resolve()
+    const baseLng = INTRO_CENTER[0]
+    const baseLat = INTRO_CENTER[1]
+    const segmentStart = nowMs()
+
+    const step = () => {
+      if (!map || introCancelled) {
+        introRafId = null
+        return resolve()
+      }
+
+      const local = Math.max(0, Math.min(1, (nowMs() - segmentStart) / durationMs))
+      const easedLocal = local * local * (3 - 2 * local)
+      const globalT = fromT + (toT - fromT) * easedLocal
+
+      const zoom = fromZoom + (toZoom - fromZoom) * easedLocal
+      const bearing = startBearing + INTRO_ROTATION_DEG * globalT
+      const angle = globalT * Math.PI * 2
+      const radiusDeg = 0.0012 * (1 - globalT)
+      const lng = baseLng + (Math.cos(angle) * radiusDeg) / Math.max(0.2, Math.cos((baseLat * Math.PI) / 180))
+      const lat = baseLat + Math.sin(angle) * radiusDeg
+
+      map.jumpTo({
+        center: [lng, lat],
+        zoom,
+        bearing,
+        pitch,
+      })
+
+      if (local < 1) {
+        introRafId = requestAnimationFrame(step)
+        return
+      }
+      introRafId = null
+      resolve()
+    }
+
+    introRafId = requestAnimationFrame(step)
+  })
+}
+
+async function runIntroZoomOut() {
   if (!map || introStarted) return
   introStarted = true
+  introCancelled = false
   introActive.value = true
   setMapInteractions(false)
 
-  const startAt = nowMs()
   const startBearing = map.getBearing()
   const startPitch = map.getPitch()
-  const baseLng = INTRO_CENTER[0]
-  const baseLat = INTRO_CENTER[1]
+  const checkpoints = [INTRO_START_ZOOM, 17.6, 16.8, 16.0, 15.2, 14.3, INTRO_END_ZOOM]
+  const segments = checkpoints.length - 1
+  const segmentDuration = Math.round(INTRO_DURATION_MS / segments)
 
-  const step = () => {
-    if (!map) return
-    const elapsed = nowMs() - startAt
-    const t = Math.max(0, Math.min(1, elapsed / INTRO_DURATION_MS))
-    const eased = t * t * (3 - 2 * t)
-
-    const zoom = INTRO_START_ZOOM + (INTRO_END_ZOOM - INTRO_START_ZOOM) * eased
-    const bearing = startBearing + 540 * eased
-    const angle = eased * Math.PI * 4
-    const radiusDeg = 0.0015 * (1 - eased)
-    const lng = baseLng + (Math.cos(angle) * radiusDeg) / Math.max(0.2, Math.cos((baseLat * Math.PI) / 180))
-    const lat = baseLat + Math.sin(angle) * radiusDeg
-
-    map.jumpTo({
-      center: [lng, lat],
-      zoom,
-      bearing,
-      pitch: startPitch,
-    })
-
-    if (t < 1) {
-      introRafId = requestAnimationFrame(step)
-      return
+  try {
+    for (let i = 0; i < segments; i += 1) {
+      if (!map || introCancelled) break
+      const fromT = i / segments
+      const toT = (i + 1) / segments
+      await runIntroZoomSegment(
+        checkpoints[i],
+        checkpoints[i + 1],
+        fromT,
+        toT,
+        segmentDuration,
+        startBearing,
+        startPitch,
+      )
+      await waitForTreesMilestone(2500)
     }
-
-    map.jumpTo({
-      center: INTRO_CENTER,
-      zoom: INTRO_END_ZOOM,
-      bearing,
-      pitch: startPitch,
-    })
-    introRafId = null
+  } finally {
+    if (map) {
+      map.jumpTo({
+        center: INTRO_CENTER,
+        zoom: INTRO_END_ZOOM,
+        bearing: startBearing + INTRO_ROTATION_DEG,
+        pitch: startPitch,
+      })
+    }
     introActive.value = false
     setMapInteractions(true)
   }
-
-  introRafId = requestAnimationFrame(step)
 }
 
 const DEFAULT_MAP_QUERY = `
@@ -379,6 +449,47 @@ function updateZoomLevel() {
   setViewportZoom(zoomLevel.value)
   const c = map.getCenter()
   setViewportCenter(c.lng, c.lat)
+
+  const z = Math.round(map.getZoom())
+  if (z >= 13 && z <= 20) {
+    const n = Math.pow(2, z)
+    const bounds = map.getBounds()
+    const lonToTileX = (lon: number) => Math.floor(((lon + 180) / 360) * n)
+    const latToTileY = (lat: number) => {
+      const latRad = (Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI) / 180
+      return Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n)
+    }
+
+    let minX = Math.max(0, Math.min(n - 1, lonToTileX(bounds.getWest())))
+    let maxX = Math.max(0, Math.min(n - 1, lonToTileX(bounds.getEast())))
+    let minY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getNorth())))
+    let maxY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getSouth())))
+
+    // Expanding range every animation frame during intro can create excessive
+    // tile churn and stall startup. Only apply wide prefetch once intro ends.
+    if (isInitialLoading.value && !introActive.value) {
+      const width = Math.max(1, maxX - minX + 1)
+      const height = Math.max(1, maxY - minY + 1)
+      const extraX = Math.ceil((width * (INITIAL_TILE_PREFETCH_SCALE - 1)) / 2)
+      const extraY = Math.ceil((height * (INITIAL_TILE_PREFETCH_SCALE - 1)) / 2)
+      minX = Math.max(0, minX - extraX)
+      maxX = Math.min(n - 1, maxX + extraX)
+      minY = Math.max(0, minY - extraY)
+      maxY = Math.min(n - 1, maxY + extraY)
+    }
+
+    const rangeSig = `${z}:${minX}-${maxX}:${minY}-${maxY}`
+    if (rangeSig !== lastVisibleRangeSig) {
+      lastVisibleRangeSig = rangeSig
+      setVisibleTileRange(z, minX, maxX, minY, maxY)
+    }
+
+    if (isInitialLoading.value) {
+      const tilesVisible = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1))
+      logIconLayerDebug('initial-visible-tiles', { z, minX, maxX, minY, maxY, tilesVisible })
+    }
+  }
+
   logIconLayerSnapshot('zoom/move')
 }
 
@@ -548,6 +659,7 @@ watch(flyToTarget, (t) => {
 })
 
 onUnmounted(() => {
+  introCancelled = true
   if (introRafId != null) cancelAnimationFrame(introRafId)
   map?.remove()
   map = null

@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS species_enrichment (
 );
 `
 
+const DEFAULT_BASE_QUERY_SQL = `
+SELECT tree_id, species, latitude, longitude, diameter_at_breast_height
+FROM trees
+WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+`
+
 let initPromise: Promise<void> | null = null
 let protocolRegistered = false
 const tileQuerySql = ref<string | null>(null)
@@ -55,6 +61,8 @@ const MAX_TILE_CACHE_ENTRIES = 1536
 let spatialExtensionReady = false
 type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }
 const dataTileBoundsByZoom = new Map<number, TileBounds>()
+const visibleTileRangeByZoom = new Map<number, TileBounds>()
+const hasAggCacheByZoom = new Set<number>()
 let activeTileRequests = 0
 let activeDuckdbCalls = 0
 const MAX_PARALLEL_TILE_WORK = 2
@@ -180,6 +188,10 @@ function getDataTileBounds(z: number): TileBounds | null {
   return dataTileBoundsByZoom.get(z) ?? null
 }
 
+function getVisibleTileRange(z: number): TileBounds | null {
+  return visibleTileRangeByZoom.get(z) ?? null
+}
+
 function isTileOutsideDataBounds(z: number, x: number, y: number): boolean {
   const b = getDataTileBounds(z)
   if (!b) return false
@@ -248,36 +260,78 @@ async function doInit() {
   const tAfterSchema = nowMs()
   console.info('[Perf] duckdb:schema:done', { ms: Math.round(tAfterSchema - t0) })
 
-  // Fetch tree JSON and register in DuckDB virtual filesystem
-  const res = await fetch(import.meta.env.BASE_URL + 'data/raw_data.json')
-  const jsonText = await res.text()
-  console.info('[Perf] duckdb:json:fetched', {
-    ms: Math.round(nowMs() - tAfterSchema),
-    bytes: jsonText.length,
-  })
-  await db.registerFileText('trees.json', jsonText)
+  // Prefer parquet cache for faster startup; fallback to JSON.
+  let loadedTreesFromParquet = false
+  try {
+    const resParquet = await fetch(import.meta.env.BASE_URL + 'data/cache/trees.parquet')
+    if (resParquet.ok) {
+      const buffer = new Uint8Array(await resParquet.arrayBuffer())
+      await db.registerFileBuffer('trees.parquet', buffer)
+      await conn.query(`INSERT INTO trees SELECT * FROM read_parquet('trees.parquet')`)
+      loadedTreesFromParquet = true
+      console.info('[Perf] duckdb:trees:loaded:parquet', { bytes: buffer.byteLength })
+    }
+  } catch {
+    // fallback below
+  }
 
-  await conn.query(`INSERT INTO trees SELECT * FROM read_json_auto('trees.json')`)
+  if (!loadedTreesFromParquet) {
+    const res = await fetch(import.meta.env.BASE_URL + 'data/raw_data.json')
+    const jsonText = await res.text()
+    console.info('[Perf] duckdb:json:fetched', {
+      ms: Math.round(nowMs() - tAfterSchema),
+      bytes: jsonText.length,
+    })
+    await db.registerFileText('trees.json', jsonText)
+    await conn.query(`INSERT INTO trees SELECT * FROM read_json_auto('trees.json')`)
+  }
 
   // Species enrichment lookup table for category + popup metadata
   try {
-    const speciesRes = await fetch(import.meta.env.BASE_URL + 'data/species_data.json')
-    if (speciesRes.ok) {
-      const speciesJson = await speciesRes.text()
-      await db.registerFileText('species.json', speciesJson)
-      await conn.query(`
-        INSERT INTO species_enrichment
-        SELECT
-          species,
-          tree_category,
-          native_status,
-          is_evergreen,
-          mature_height_ft,
-          bloom_season,
-          wildlife_value,
-          fire_risk
-        FROM read_json_auto('species.json')
-      `)
+    let loadedSpeciesFromParquet = false
+    try {
+      const speciesParquetRes = await fetch(import.meta.env.BASE_URL + 'data/cache/species.parquet')
+      if (speciesParquetRes.ok) {
+        const buffer = new Uint8Array(await speciesParquetRes.arrayBuffer())
+        await db.registerFileBuffer('species.parquet', buffer)
+        await conn.query(`
+          INSERT INTO species_enrichment
+          SELECT
+            species,
+            tree_category,
+            native_status,
+            is_evergreen,
+            mature_height_ft,
+            bloom_season,
+            wildlife_value,
+            fire_risk
+          FROM read_parquet('species.parquet')
+        `)
+        loadedSpeciesFromParquet = true
+      }
+    } catch {
+      // fallback below
+    }
+
+    if (!loadedSpeciesFromParquet) {
+      const speciesRes = await fetch(import.meta.env.BASE_URL + 'data/species_data.json')
+      if (speciesRes.ok) {
+        const speciesJson = await speciesRes.text()
+        await db.registerFileText('species.json', speciesJson)
+        await conn.query(`
+          INSERT INTO species_enrichment
+          SELECT
+            species,
+            tree_category,
+            native_status,
+            is_evergreen,
+            mature_height_ft,
+            bloom_season,
+            wildlife_value,
+            fire_risk
+          FROM read_json_auto('species.json')
+        `)
+      }
     }
   } catch (e) {
     console.warn('[Perf] duckdb:species-load:failed', e)
@@ -285,7 +339,22 @@ async function doInit() {
 
   // Precompute map-focused fields once so tile queries stay fast.
   const tFastStart = nowMs()
-  await conn.query(`
+  let loadedTreesFastFromParquet = false
+  try {
+    const treesFastRes = await fetch(import.meta.env.BASE_URL + 'data/cache/trees_fast.parquet')
+    if (treesFastRes.ok) {
+      const buffer = new Uint8Array(await treesFastRes.arrayBuffer())
+      await db.registerFileBuffer('trees_fast.parquet', buffer)
+      await conn.query(`CREATE OR REPLACE TABLE trees_fast AS SELECT * FROM read_parquet('trees_fast.parquet')`)
+      loadedTreesFastFromParquet = true
+      console.info('[Perf] duckdb:trees_fast:loaded:parquet', { bytes: buffer.byteLength })
+    }
+  } catch {
+    // fallback below
+  }
+
+  if (!loadedTreesFastFromParquet) {
+    await conn.query(`
     CREATE OR REPLACE TABLE trees_fast AS
     WITH joined AS (
       SELECT
@@ -357,7 +426,22 @@ async function doInit() {
       CAST(floor(y_norm * pow(2, 20)) AS INTEGER) AS ytile_z20
     FROM joined
   `)
+  }
   console.info('[Perf] duckdb:trees_fast:done', { ms: Math.round(nowMs() - tFastStart) })
+
+  hasAggCacheByZoom.clear()
+  for (const z of [13, 14]) {
+    try {
+      const resAgg = await fetch(import.meta.env.BASE_URL + `data/cache/agg_z${z}.parquet`)
+      if (!resAgg.ok) continue
+      const buffer = new Uint8Array(await resAgg.arrayBuffer())
+      await db.registerFileBuffer(`agg_z${z}.parquet`, buffer)
+      await conn.query(`CREATE OR REPLACE TABLE agg_z${z}_cache AS SELECT * FROM read_parquet('agg_z${z}.parquet')`)
+      hasAggCacheByZoom.add(z)
+    } catch {
+      // runtime fallback stays active
+    }
+  }
 
   // Cache dataset tile bounds per zoom to fast-reject empty/out-of-range tiles.
   dataTileBoundsByZoom.clear()
@@ -410,13 +494,17 @@ function parseDuckdbTileUrl(url: string): { z: number; x: number; y: number } | 
 
 function sanitizeBaseQuery(sql: string | null): string {
   if (!sql?.trim()) {
-    return `
-      SELECT tree_id, species, latitude, longitude, diameter_at_breast_height
-      FROM trees
-      WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-    `
+    return DEFAULT_BASE_QUERY_SQL
   }
   return sql.trim().replace(/;+\s*$/, '')
+}
+
+function normalizeSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function isDefaultBaseQuery(sql: string): boolean {
+  return normalizeSql(sql) === normalizeSql(DEFAULT_BASE_QUERY_SQL)
 }
 
 function tileCacheKey(z: number, x: number, y: number): string {
@@ -556,6 +644,14 @@ async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, bas
   let maxX = Math.min(tileCount - 1, minX + blockSize - 1)
   let minY = Math.max(0, blockY * blockSize)
   let maxY = Math.min(tileCount - 1, minY + blockSize - 1)
+
+  const visibleRange = getVisibleTileRange(z)
+  if (visibleRange && x >= visibleRange.minX && x <= visibleRange.maxX && y >= visibleRange.minY && y <= visibleRange.maxY) {
+    minX = visibleRange.minX
+    maxX = visibleRange.maxX
+    minY = visibleRange.minY
+    maxY = visibleRange.maxY
+  }
 
   const dataBounds = getDataTileBounds(z)
   if (dataBounds) {
@@ -821,8 +917,47 @@ async function ensureZoomBatchTiles(z: number, baseQuery: string, simplifyGridMe
     AND ytile >= 0
     AND xtile < CAST(pow(2, ${z}) AS INTEGER)
     AND ytile < CAST(pow(2, ${z}) AS INTEGER)`
+  const useAggCache = simplifyGridMeters > 0 && hasAggCacheByZoom.has(z) && isDefaultBaseQuery(baseQuery)
   const request = (async () => {
-    const sql = simplifyGridMeters > 0 ? `
+    const sql = useAggCache ? `
+WITH agg AS (
+  SELECT
+    xtile,
+    ytile,
+    gx,
+    gy,
+    dbh,
+    point_count
+  FROM agg_z${z}_cache
+  ${boundedFilter}
+), rows AS (
+  SELECT
+    xtile,
+    ytile,
+    {
+      'geometry': ST_AsMVTGeom(
+        ST_Point(gx, gy),
+        ST_Extent(ST_TileEnvelope(${z}, xtile, ytile)),
+        4096,
+        64,
+        true
+      ),
+      'id': -1,
+      'dbh': TRY_CAST(dbh AS DOUBLE),
+      'category': 'default',
+      'rotation': 0,
+      'point_count': TRY_CAST(point_count AS INTEGER)
+    } AS feature
+  FROM agg
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geometry') AS mvt
+FROM rows
+WHERE feature.geometry IS NOT NULL AND NOT ST_IsEmpty(feature.geometry)
+GROUP BY xtile, ytile
+` : simplifyGridMeters > 0 ? `
 WITH base AS (
   ${baseQuery}
 ), pts AS (
@@ -1196,6 +1331,7 @@ export function useDuckDB() {
     inflightNeighborhoodBatch.clear()
     preparedFeatureTableRevisionByZoom.clear()
     inflightFeatureTableBuild.clear()
+    visibleTileRangeByZoom.clear()
     prewarmDoneRevision = -1
     prewarmPromise = null
     resetTimingBuckets()
@@ -1209,6 +1345,16 @@ export function useDuckDB() {
   function setViewportCenter(lng: number, lat: number) {
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
     activeViewportCenter.value = { lng, lat }
+  }
+
+  function setVisibleTileRange(z: number, minX: number, maxX: number, minY: number, maxY: number) {
+    if (![z, minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) return
+    visibleTileRangeByZoom.set(z, {
+      minX: Math.floor(Math.min(minX, maxX)),
+      maxX: Math.floor(Math.max(minX, maxX)),
+      minY: Math.floor(Math.min(minY, maxY)),
+      maxY: Math.floor(Math.max(minY, maxY)),
+    })
   }
 
   async function prewarmLodCaches(): Promise<void> {
@@ -1231,15 +1377,32 @@ export function useDuckDB() {
       const t0 = nowMs()
       console.info('[Perf] duckdb:prewarm:start', { rev })
       try {
-        await ensureZoomBatchTiles(13, baseQuery, 64)
-        await ensureZoomBatchTiles(14, baseQuery, 32)
-        await ensurePreparedFeatureTableForZoom(15, baseQuery)
-
         const viewport = activeViewportCenter.value
+        const focusZoom = Math.max(15, Math.min(19, Math.round(activeViewportZoom.value)))
+
+        if (viewport) {
+          // 1) precise LOD first around current camera zoom/center
+          const cFocus = lngLatToTile(viewport.lng, viewport.lat, focusZoom)
+          await ensureNeighborhoodBatchTiles(focusZoom, cFocus.x, cFocus.y, baseQuery)
+
+          // 1b) optionally prewarm one ring coarser for immediate zoom-out smoothness
+          const zMinusOne = focusZoom - 1
+          if (zMinusOne >= 15) {
+            const cMinusOne = lngLatToTile(viewport.lng, viewport.lat, zMinusOne)
+            await ensureNeighborhoodBatchTiles(zMinusOne, cMinusOne.x, cMinusOne.y, baseQuery)
+          }
+        }
+
+        // 2) keep z15 hot path prebuilt (feature table + center neighborhood)
+        await ensurePreparedFeatureTableForZoom(15, baseQuery)
         if (viewport) {
           const c15 = lngLatToTile(viewport.lng, viewport.lat, 15)
           await ensureNeighborhoodBatchTiles(15, c15.x, c15.y, baseQuery)
         }
+
+        // 3) then pull out to coarse aggregated caches
+        await ensureZoomBatchTiles(14, baseQuery, 32)
+        await ensureZoomBatchTiles(13, baseQuery, 64)
       } finally {
         if (tileQueryRevision === rev) {
           prewarmDoneRevision = rev
@@ -1292,6 +1455,7 @@ export function useDuckDB() {
     setTileQuery,
     setViewportZoom,
     setViewportCenter,
+    setVisibleTileRange,
     prewarmLodCaches,
   }
 }
