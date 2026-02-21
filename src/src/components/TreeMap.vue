@@ -62,6 +62,38 @@ const INITIAL_TILE_PREFETCH_SCALE = 3.5
 const TREES_SOURCE_MAXZOOM = 16
 const SCROLL_WHEEL_ZOOM_RATE = 1 / 1800
 const SCROLL_ZOOM_RATE = 1 / 400
+const CENTER_ICON_GRID_RADIUS_PX = 96
+const CENTER_ICON_GRID_SIZE = 3
+const CENTER_ICON_GRID_MIN_POPULATED_CELLS = 5
+const CENTER_ICON_GRID_MIN_TOTAL_ICONS = 8
+
+// Centralized zoom pivot points for layer transitions/sizing.
+const HEATMAP_ZOOM_INTENSITY_START = 10
+const HEATMAP_ZOOM_INTENSITY_MID = 13
+const HEATMAP_ZOOM_INTENSITY_END = 15
+const HEATMAP_ZOOM_RADIUS_START = 10
+const HEATMAP_ZOOM_RADIUS_MID = 13
+const HEATMAP_ZOOM_RADIUS_END = 15
+const HEATMAP_ZOOM_OPACITY_START = HEATMAP_ZOOM_RADIUS_START
+const HEATMAP_ZOOM_OPACITY_MID = HEATMAP_ZOOM_RADIUS_MID
+const HEATMAP_ZOOM_OPACITY_END = HEATMAP_ZOOM_RADIUS_END
+
+const CIRCLE_ZOOM_MIN = 12.8
+const CIRCLE_ZOOM_RADIUS_MID = 15
+const CIRCLE_ZOOM_RADIUS_HIGH = 18
+const CIRCLE_ZOOM_RADIUS_MAX = 20
+const CIRCLE_ZOOM_MAX = 15.5
+const CIRCLE_ZOOM_OPACITY_START = CIRCLE_ZOOM_MIN
+const CIRCLE_ZOOM_OPACITY_MID = CIRCLE_ZOOM_RADIUS_MID
+const CIRCLE_ZOOM_OPACITY_END = CIRCLE_ZOOM_MAX
+
+const ICON_ZOOM_MIN = 14.4
+const ICON_ZOOM_SIZE_MID = 15
+const ICON_ZOOM_SIZE_HIGH = 18
+const ICON_ZOOM_SIZE_MAX = 20
+const ICON_ZOOM_OPACITY_START = ICON_ZOOM_MIN
+const ICON_ZOOM_OPACITY_MID = ICON_ZOOM_SIZE_MID
+const ICON_ZOOM_OPACITY_END = ICON_ZOOM_SIZE_MAX
 
 type IntroPrefetchStatus = 'executed' | 'deduped' | 'skipped'
 type IntroPrefetchCounters = { requested: number; executed: number; deduped: number; skipped: number }
@@ -140,6 +172,84 @@ async function waitForTreesMilestone(timeoutMs = 2500): Promise<void> {
   })
 }
 
+async function waitForInitialDetailedTrees(timeoutMs = 5000): Promise<void> {
+  if (!map) return
+  const startedAt = nowMs()
+
+  await new Promise<void>((resolve) => {
+    if (!map) return resolve()
+
+    const tick = () => {
+      if (!map) return resolve()
+
+      const iconCount = map.queryRenderedFeatures(undefined, { layers: ['trees-icon'] }).length
+      if (iconCount > 0) return resolve()
+
+      if (nowMs() - startedAt >= timeoutMs) return resolve()
+      requestAnimationFrame(tick)
+    }
+
+    tick()
+  })
+}
+
+async function waitForCenteredDetailedTrees(timeoutMs = 5000): Promise<void> {
+  if (!map) return
+  const startedAt = nowMs()
+
+  await new Promise<void>((resolve) => {
+    if (!map) return resolve()
+
+    const tick = () => {
+      if (!map) return resolve()
+
+      const center = map.getCenter()
+      const centerPx = map.project(center)
+      const gridSize = Math.max(1, CENTER_ICON_GRID_SIZE)
+      const radiusPx = CENTER_ICON_GRID_RADIUS_PX
+      const minX = centerPx.x - radiusPx
+      const minY = centerPx.y - radiusPx
+      const cellSize = (radiusPx * 2) / gridSize
+      const centerIndex = Math.floor(gridSize / 2)
+
+      let totalIcons = 0
+      let populatedCells = 0
+      let centerCellIcons = 0
+
+      for (let row = 0; row < gridSize; row += 1) {
+        for (let col = 0; col < gridSize; col += 1) {
+          const cellMinX = minX + col * cellSize
+          const cellMinY = minY + row * cellSize
+          const cellMaxX = cellMinX + cellSize
+          const cellMaxY = cellMinY + cellSize
+          const cellIcons = map.queryRenderedFeatures(
+            [
+              [cellMinX, cellMinY],
+              [cellMaxX, cellMaxY],
+            ],
+            { layers: ['trees-icon'] },
+          ).length
+
+          totalIcons += cellIcons
+          if (cellIcons > 0) populatedCells += 1
+          if (row === centerIndex && col === centerIndex) {
+            centerCellIcons = cellIcons
+          }
+        }
+      }
+
+      const centerReady = centerCellIcons > 0
+      const gridReady = populatedCells >= CENTER_ICON_GRID_MIN_POPULATED_CELLS
+      const densityReady = totalIcons >= CENTER_ICON_GRID_MIN_TOTAL_ICONS
+      if (centerReady && gridReady && densityReady) return resolve()
+      if (nowMs() - startedAt >= timeoutMs) return resolve()
+      requestAnimationFrame(tick)
+    }
+
+    tick()
+  })
+}
+
 function runIntroZoomSegment(
   fromZoom: number,
   toZoom: number,
@@ -168,7 +278,8 @@ function runIntroZoomSegment(
       const zoom = fromZoom + (toZoom - fromZoom) * easedLocal
       const bearing = startBearing + INTRO_ROTATION_DEG * globalT
       const angle = globalT * Math.PI * 2
-      const radiusDeg = 0.0012 * (1 - globalT)
+      // Start/end at exact center to avoid a visible hop.
+      const radiusDeg = 0.0012 * Math.sin(globalT * Math.PI)
       const lng = baseLng + (Math.cos(angle) * radiusDeg) / Math.max(0.2, Math.cos((baseLat * Math.PI) / 180))
       const lat = baseLat + Math.sin(angle) * radiusDeg
 
@@ -202,32 +313,44 @@ async function runIntroZoomOut() {
 
   const startBearing = map.getBearing()
   const startPitch = map.getPitch()
-  const checkpoints = [INTRO_START_ZOOM, 17.6, 16.8, 16.0, 15.2, 14.3, INTRO_END_ZOOM]
-  const segments = checkpoints.length - 1
-  const segmentDuration = Math.round(INTRO_DURATION_MS / segments)
 
   try {
-    for (let i = 0; i < segments; i += 1) {
-      if (!map || introCancelled) break
-      const fromT = i / segments
-      const toT = (i + 1) / segments
+    // Re-anchor to the exact intro start pose first, then wait for centered
+    // detailed icons before beginning motion.
+    map.jumpTo({
+      center: INTRO_CENTER,
+      zoom: INTRO_START_ZOOM,
+      bearing: startBearing,
+      pitch: startPitch,
+    })
+
+    // Publish initial visible ranges before prefetching.
+    updateZoomLevel()
+
+    // Hard gate intro movement until detailed tiles are actually rendered at
+    // the starting viewpoint.
+    const startZoomRounded = Math.round(INTRO_START_ZOOM)
+    const prefetchZooms = Array.from(new Set([startZoomRounded, Math.max(15, startZoomRounded - 1)]))
+    for (const z of prefetchZooms) {
+      if (z < 15) continue
+      const status = await prefetchVisibleDetailTilesAtZoom(z)
+      recordIntroPrefetchStatus(z, status)
+    }
+
+    await waitForTreesMilestone(2500)
+    await waitForInitialDetailedTrees(5000)
+    await waitForCenteredDetailedTrees(5000)
+
+    if (!introCancelled) {
       await runIntroZoomSegment(
-        checkpoints[i],
-        checkpoints[i + 1],
-        fromT,
-        toT,
-        segmentDuration,
+        INTRO_START_ZOOM,
+        INTRO_END_ZOOM,
+        0,
+        1,
+        INTRO_DURATION_MS,
         startBearing,
         startPitch,
       )
-
-      const stageZoom = Math.round(checkpoints[i + 1])
-      if (stageZoom >= 15) {
-        const status = await prefetchVisibleDetailTilesAtZoom(stageZoom)
-        recordIntroPrefetchStatus(stageZoom, status)
-      }
-
-      await waitForTreesMilestone(2500)
     }
   } finally {
     setAutoTileFetchEnabled(true)
@@ -341,10 +464,10 @@ function buildSqrtDbhExpression(minValue: number, maxValue: number): maplibregl.
 function buildCircleRadiusExpression(): maplibregl.ExpressionSpecification {
   return [
     'interpolate', ['linear'], ['zoom'],
-    12.8, buildSqrtDbhExpression(0.85, 2.2),
-    15, buildSqrtDbhExpression(2.1, 5.6),
-    18, buildSqrtDbhExpression(3.1, 9.5),
-    20, buildSqrtDbhExpression(3.7, 11.6),
+    CIRCLE_ZOOM_MIN, buildSqrtDbhExpression(0.65, 1),
+    CIRCLE_ZOOM_RADIUS_MID, buildSqrtDbhExpression(2.1, 5.6),
+    CIRCLE_ZOOM_RADIUS_HIGH, buildSqrtDbhExpression(3.1, 9.5),
+    CIRCLE_ZOOM_RADIUS_MAX, buildSqrtDbhExpression(3.7, 11.6),
   ] as maplibregl.ExpressionSpecification
 }
 
@@ -352,10 +475,10 @@ function buildIconSizeExpression(): maplibregl.ExpressionSpecification {
   return [
     'interpolate', ['linear'], ['zoom'],
     // Match apparent size with circle layer around z15 to avoid pop.
-    14.4, buildSqrtDbhExpression(0.04, 0.1),
-    15, buildSqrtDbhExpression(0.055, 0.15),
-    18, buildSqrtDbhExpression(0.2, 0.72),
-    20, buildSqrtDbhExpression(0.28, 1.0),
+    ICON_ZOOM_MIN, buildSqrtDbhExpression(0.04, 0.1),
+    ICON_ZOOM_SIZE_MID, buildSqrtDbhExpression(0.055, 0.15),
+    ICON_ZOOM_SIZE_HIGH, buildSqrtDbhExpression(0.2, 0.72),
+    ICON_ZOOM_SIZE_MAX, buildSqrtDbhExpression(0.28, 1.0),
   ] as maplibregl.ExpressionSpecification
 }
 
@@ -486,7 +609,7 @@ function addTreeLayers() {
     type: 'heatmap',
     source: 'trees',
     'source-layer': 'trees',
-    maxzoom: 15.6,
+    maxzoom: HEATMAP_ZOOM_OPACITY_END,
     paint: {
       // Normalize count by grid area so heatmap color is consistent across
       // different aggregation tiers. Reference grid is 32m.
@@ -503,8 +626,18 @@ function addTreeLayers() {
         32, 0.75,
         128, 1.05,
       ],
-      'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 10, 0.85, 13, 1.2, 15, 1.9],
-      'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 10, 10, 13, 14, 15, 22],
+      'heatmap-intensity': [
+        'interpolate', ['linear'], ['zoom'],
+        HEATMAP_ZOOM_INTENSITY_START, 0.85,
+        HEATMAP_ZOOM_INTENSITY_MID, 1.2,
+        HEATMAP_ZOOM_INTENSITY_END, 1.9,
+      ],
+      'heatmap-radius': [
+        'interpolate', ['linear'], ['zoom'],
+        HEATMAP_ZOOM_RADIUS_START, 10,
+        HEATMAP_ZOOM_RADIUS_MID, 14,
+        HEATMAP_ZOOM_RADIUS_END, 22,
+      ],
       'heatmap-color': [
         'interpolate',
         ['linear'],
@@ -516,7 +649,12 @@ function addTreeLayers() {
         0.75, '#4CAF50',
         1, '#8BC34A',
       ],
-      'heatmap-opacity': ['interpolate', ['linear'], ['zoom'], 13, 1.0, 14.8, 0.62, 15.6, 0],
+      'heatmap-opacity': [
+        'interpolate', ['linear'], ['zoom'],
+        HEATMAP_ZOOM_OPACITY_START, 1.0,
+        HEATMAP_ZOOM_OPACITY_MID, 0.62,
+        HEATMAP_ZOOM_OPACITY_END, 0,
+      ],
     },
   })
 
@@ -526,8 +664,8 @@ function addTreeLayers() {
     type: 'circle',
     source: 'trees',
     'source-layer': 'trees',
-    minzoom: 12.8,
-    maxzoom: 18.6,
+    minzoom: CIRCLE_ZOOM_MIN,
+    maxzoom: CIRCLE_ZOOM_MAX,
     paint: {
       'circle-radius': [
         ...buildCircleRadiusExpression(),
@@ -535,16 +673,15 @@ function addTreeLayers() {
       'circle-color': buildColorExpression(),
       'circle-opacity': [
         'interpolate', ['linear'], ['zoom'],
-        12.8, 0,
-        13.6, 0.92,
-        15, 0.88,
-        16.8, 0.74,
-        18.6, 0,
+        CIRCLE_ZOOM_OPACITY_START, 0,
+        CIRCLE_ZOOM_OPACITY_MID, 0.92,
+        CIRCLE_ZOOM_OPACITY_END - .1, .75,
+        CIRCLE_ZOOM_OPACITY_END, 0,
       ],
       'circle-pitch-alignment': 'map',
       'circle-pitch-scale': 'map',
       'circle-stroke-width': 0.65,
-      'circle-stroke-color': 'rgba(255,255,255,0.42)',
+      'circle-stroke-color': 'rgba(255,255,255,0)',
     },
   })
 
@@ -554,7 +691,7 @@ function addTreeLayers() {
     type: 'symbol',
     source: 'trees',
     'source-layer': 'trees',
-    minzoom: 14.4,
+    minzoom: ICON_ZOOM_MIN,
     layout: {
       'icon-image': buildIconExpression(),
       'icon-size': [
@@ -567,7 +704,12 @@ function addTreeLayers() {
       'icon-ignore-placement': true,
     },
     paint: {
-      'icon-opacity': ['interpolate', ['linear'], ['zoom'], 14.4, 0, 15, 0.72, 15.8, 1],
+      'icon-opacity': [
+        'interpolate', ['linear'], ['zoom'],
+        ICON_ZOOM_OPACITY_START, 0,
+        ICON_ZOOM_OPACITY_MID, 0.72,
+        ICON_ZOOM_OPACITY_END, 1,
+      ],
     },
   })
 
@@ -711,8 +853,8 @@ onMounted(() => {
 
   // Reduce scroll zoom sensitivity for smoother manual zooming.
   try {
-    ;(map.scrollZoom as any).setWheelZoomRate?.(SCROLL_WHEEL_ZOOM_RATE)
-    ;(map.scrollZoom as any).setZoomRate?.(SCROLL_ZOOM_RATE)
+    ; (map.scrollZoom as any).setWheelZoomRate?.(SCROLL_WHEEL_ZOOM_RATE)
+      ; (map.scrollZoom as any).setZoomRate?.(SCROLL_ZOOM_RATE)
   } catch {
     // no-op
   }

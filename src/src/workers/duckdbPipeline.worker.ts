@@ -1,0 +1,1351 @@
+import * as duckdb from '@duckdb/duckdb-wasm'
+import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url'
+import duckdb_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url'
+import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url'
+import duckdb_worker_eh from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url'
+
+let db: duckdb.AsyncDuckDB | null = null
+let conn: duckdb.AsyncDuckDBConnection | null = null
+let ready = false
+let initError: string | null = null
+let initPromise: Promise<void> | null = null
+
+const TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS trees (
+  tree_id INTEGER,
+  common_name VARCHAR,
+  site_info VARCHAR,
+  plant_date VARCHAR,
+  species VARCHAR,
+  latitude DOUBLE,
+  longitude DOUBLE,
+  diameter_at_breast_height DOUBLE
+);
+`
+
+const SPECIES_DDL = `
+CREATE TABLE IF NOT EXISTS species_enrichment (
+  species VARCHAR,
+  tree_category VARCHAR,
+  native_status VARCHAR,
+  is_evergreen BOOLEAN,
+  mature_height_ft DOUBLE,
+  bloom_season VARCHAR,
+  wildlife_value VARCHAR,
+  fire_risk VARCHAR
+);
+`
+
+const DEFAULT_BASE_QUERY_SQL = `
+SELECT tree_id, species, latitude, longitude, diameter_at_breast_height
+FROM trees
+WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+`
+
+const WEB_MERCATOR_MAX = 20037508.342789244
+const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
+const MAX_TILE_CACHE_ENTRIES = 1536
+const MAX_PARALLEL_TILE_WORK = 2
+
+type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }
+type PrefetchStatus = 'executed' | 'deduped' | 'skipped'
+
+type QueuedTileRequest = {
+  z: number
+  x: number
+  y: number
+  enqueuedAt: number
+  resolve: (tile: Uint8Array) => void
+  reject: (error: unknown) => void
+}
+
+const tileCache = new Map<string, Uint8Array>()
+const emptyTileKeys = new Set<string>()
+const inflightTileRequests = new Map<string, Promise<Uint8Array>>()
+const zoomBatchReady = new Set<string>()
+const inflightZoomBatch = new Map<string, Promise<void>>()
+const inflightNeighborhoodBatch = new Map<string, Promise<void>>()
+const preparedFeatureTableRevisionByZoom = new Map<number, number>()
+const inflightFeatureTableBuild = new Map<string, Promise<void>>()
+const dataTileBoundsByZoom = new Map<number, TileBounds>()
+const visibleTileRangeByZoom = new Map<number, TileBounds>()
+const hasAggCacheByZoom = new Set<number>()
+const prefetchedVisibleRangeSigByZoom = new Map<number, string>()
+const pendingTileQueue: QueuedTileRequest[] = []
+
+let tileQuerySql: string | null = null
+let tileQueryRevision = 0
+let activeViewportZoom = 13
+let activeViewportCenter: { lng: number; lat: number } | null = null
+let spatialExtensionReady = false
+let prewarmDoneRevision = -1
+let prewarmPromise: Promise<void> | null = null
+let autoTileFetchEnabled = true
+let activeQueuedWorkers = 0
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now()
+}
+
+function sanitizeBaseQuery(sql: string | null): string {
+  if (!sql?.trim()) return DEFAULT_BASE_QUERY_SQL
+  return sql.trim().replace(/;+\s*$/, '')
+}
+
+function normalizeSql(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function isDefaultBaseQuery(sql: string): boolean {
+  return normalizeSql(sql) === normalizeSql(DEFAULT_BASE_QUERY_SQL)
+}
+
+function tileCacheKey(z: number, x: number, y: number): string {
+  return `${tileQueryRevision}:${z}/${x}/${y}`
+}
+
+function tileCacheKeyForRevision(rev: number, z: number, x: number, y: number): string {
+  return `${rev}:${z}/${x}/${y}`
+}
+
+function zoomBatchKey(rev: number, z: number): string {
+  return `${rev}:${z}`
+}
+
+function neighborhoodBatchKey(rev: number, z: number, minX: number, maxX: number, minY: number, maxY: number): string {
+  return `${rev}:${z}:${minX}-${maxX}:${minY}-${maxY}`
+}
+
+function featureTableBuildKey(rev: number, z: number): string {
+  return `${rev}:${z}`
+}
+
+function featureTableName(z: number): string {
+  return `tile_features_z${z}`
+}
+
+function shouldUseZoomBatch(z: number): boolean {
+  return z >= 11 && z <= 14
+}
+
+function neighborhoodBlockSizeForZoom(z: number): number {
+  if (z === 15) return 8
+  if (z === 16) return 6
+  if (z >= 19) return 4
+  if (z >= 17) return 6
+  return 1
+}
+
+function tileXExpr(alias: string, z: number): string {
+  if (z >= 13 && z <= 20) return `${alias}.xtile_z${z}`
+  return `CAST(floor(((${alias}.x_3857) + ${WEB_MERCATOR_MAX}) / (${WEB_MERCATOR_WORLD} / pow(2, ${z}))) AS INTEGER)`
+}
+
+function tileYExpr(alias: string, z: number): string {
+  if (z >= 13 && z <= 20) return `${alias}.ytile_z${z}`
+  return `CAST(floor((${WEB_MERCATOR_MAX} - (${alias}.y_3857)) / (${WEB_MERCATOR_WORLD} / pow(2, ${z}))) AS INTEGER)`
+}
+
+function getDataTileBounds(z: number): TileBounds | null {
+  return dataTileBoundsByZoom.get(z) ?? null
+}
+
+function getVisibleTileRange(z: number): TileBounds | null {
+  return visibleTileRangeByZoom.get(z) ?? null
+}
+
+function isTileOutsideDataBounds(z: number, x: number, y: number): boolean {
+  const b = getDataTileBounds(z)
+  if (!b) return false
+  return x < b.minX || x > b.maxX || y < b.minY || y > b.maxY
+}
+
+function baseSimplifyGridMetersForZoom(z: number): number {
+  if (z <= 13) return 32
+  if (z === 14) return 24
+  return 0
+}
+
+function lngLatToTile(lng: number, lat: number, z: number): { x: number; y: number } {
+  const n = Math.pow(2, z)
+  const x = Math.floor(((lng + 180) / 360) * n)
+  const latRad = (lat * Math.PI) / 180
+  const y = Math.floor(
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n,
+  )
+  return {
+    x: Math.max(0, Math.min(n - 1, x)),
+    y: Math.max(0, Math.min(n - 1, y)),
+  }
+}
+
+function adaptiveLodForTile(z: number, x: number, y: number): { simplifyGridMeters: number; tileDistance: number | null } {
+  let simplifyGridMeters = baseSimplifyGridMetersForZoom(z)
+  if (simplifyGridMeters > 0) {
+    return { simplifyGridMeters, tileDistance: null }
+  }
+
+  const viewport = activeViewportCenter
+  if (!viewport) {
+    return { simplifyGridMeters, tileDistance: null }
+  }
+
+  const center = lngLatToTile(viewport.lng, viewport.lat, z)
+  const tileDistance = Math.max(Math.abs(x - center.x), Math.abs(y - center.y))
+
+  if (z === 15) {
+    if (tileDistance > 12) simplifyGridMeters = 96
+    else if (tileDistance > 8) simplifyGridMeters = 64
+    else if (tileDistance > 5) simplifyGridMeters = 32
+  } else if (z === 16) {
+    if (tileDistance > 14) simplifyGridMeters = 64
+    else if (tileDistance > 10) simplifyGridMeters = 32
+    else if (tileDistance > 7) simplifyGridMeters = 16
+  }
+
+  return { simplifyGridMeters, tileDistance }
+}
+
+function tileBounds3857(z: number, x: number, y: number): { minX: number; minY: number; maxX: number; maxY: number } {
+  const n = Math.pow(2, z)
+  const span = WEB_MERCATOR_WORLD / n
+  const minX = -WEB_MERCATOR_MAX + x * span
+  const maxX = minX + span
+  const maxY = WEB_MERCATOR_MAX - y * span
+  const minY = maxY - span
+  return { minX, minY, maxX, maxY }
+}
+
+function pickNextQueuedTileIndex(): number {
+  if (pendingTileQueue.length <= 1) return 0
+  const viewport = activeViewportCenter
+  const viewportZoom = Math.round(activeViewportZoom)
+  const now = Date.now()
+  let bestIdx = 0
+  let bestScore = Number.POSITIVE_INFINITY
+
+  for (let i = 0; i < pendingTileQueue.length; i += 1) {
+    const q = pendingTileQueue[i]
+    const zoomPenalty = Math.abs(q.z - viewportZoom) * 1000
+    let distancePenalty = 0
+    if (viewport) {
+      const centerTile = lngLatToTile(viewport.lng, viewport.lat, q.z)
+      distancePenalty = (Math.abs(q.x - centerTile.x) + Math.abs(q.y - centerTile.y)) * 10
+    }
+    const ageBonus = (now - q.enqueuedAt) / 100
+    const score = zoomPenalty + distancePenalty - ageBonus
+    if (score < bestScore) {
+      bestScore = score
+      bestIdx = i
+    }
+  }
+
+  return bestIdx
+}
+
+function processTileQueue(): void {
+  while (activeQueuedWorkers < MAX_PARALLEL_TILE_WORK && pendingTileQueue.length > 0) {
+    const idx = pickNextQueuedTileIndex()
+    const item = pendingTileQueue.splice(idx, 1)[0]
+    activeQueuedWorkers += 1
+
+    void generatePointTileMvt(item.z, item.x, item.y)
+      .then((tile) => item.resolve(tile))
+      .catch((e) => item.reject(e))
+      .finally(() => {
+        activeQueuedWorkers -= 1
+        processTileQueue()
+      })
+  }
+}
+
+function queueTileRequest(z: number, x: number, y: number): Promise<Uint8Array> {
+  return new Promise<Uint8Array>((resolve, reject) => {
+    pendingTileQueue.push({ z, x, y, enqueuedAt: Date.now(), resolve, reject })
+    processTileQueue()
+  })
+}
+
+function getCachedTile(key: string): Uint8Array | null {
+  const tile = tileCache.get(key)
+  if (!tile) {
+    if (emptyTileKeys.has(key)) return new Uint8Array()
+    return null
+  }
+  tileCache.delete(key)
+  tileCache.set(key, tile)
+  return new Uint8Array(tile)
+}
+
+function setCachedTile(key: string, tile: Uint8Array): void {
+  if (tile.byteLength === 0) {
+    emptyTileKeys.add(key)
+    if (tileCache.has(key)) tileCache.delete(key)
+    return
+  }
+
+  emptyTileKeys.delete(key)
+  if (tileCache.has(key)) tileCache.delete(key)
+  tileCache.set(key, tile)
+  if (tileCache.size > MAX_TILE_CACHE_ENTRIES) {
+    const firstKey = tileCache.keys().next().value as string | undefined
+    if (firstKey) tileCache.delete(firstKey)
+  }
+}
+
+async function doInit() {
+  if (db) return
+  const t0 = nowMs()
+  console.info('[Perf] duckdb-worker:init:start')
+
+  const bundles: duckdb.DuckDBBundles = {
+    mvp: {
+      mainModule: duckdb_wasm,
+      mainWorker: duckdb_worker,
+    },
+    eh: {
+      mainModule: duckdb_wasm_eh,
+      mainWorker: duckdb_worker_eh,
+    },
+  }
+  const bundle = await duckdb.selectBundle(bundles)
+
+  const logger = new duckdb.ConsoleLogger()
+  const worker = new Worker(bundle.mainWorker!)
+  db = new duckdb.AsyncDuckDB(logger, worker)
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker)
+
+  conn = await db.connect()
+  await conn.query(TABLE_DDL)
+  await conn.query(SPECIES_DDL)
+
+  let loadedTreesFromParquet = false
+  try {
+    const resParquet = await fetch(import.meta.env.BASE_URL + 'data/cache/trees.parquet')
+    if (resParquet.ok) {
+      const buffer = new Uint8Array(await resParquet.arrayBuffer())
+      await db.registerFileBuffer('trees.parquet', buffer)
+      await conn.query(`INSERT INTO trees SELECT * FROM read_parquet('trees.parquet')`)
+      loadedTreesFromParquet = true
+    }
+  } catch {
+    // fallback below
+  }
+
+  if (!loadedTreesFromParquet) {
+    const res = await fetch(import.meta.env.BASE_URL + 'data/raw_data.json')
+    const jsonText = await res.text()
+    await db.registerFileText('trees.json', jsonText)
+    await conn.query(`INSERT INTO trees SELECT * FROM read_json_auto('trees.json')`)
+  }
+
+  try {
+    let loadedSpeciesFromParquet = false
+    try {
+      const speciesParquetRes = await fetch(import.meta.env.BASE_URL + 'data/cache/species.parquet')
+      if (speciesParquetRes.ok) {
+        const buffer = new Uint8Array(await speciesParquetRes.arrayBuffer())
+        await db.registerFileBuffer('species.parquet', buffer)
+        await conn.query(`
+          INSERT INTO species_enrichment
+          SELECT
+            species,
+            tree_category,
+            native_status,
+            is_evergreen,
+            mature_height_ft,
+            bloom_season,
+            wildlife_value,
+            fire_risk
+          FROM read_parquet('species.parquet')
+        `)
+        loadedSpeciesFromParquet = true
+      }
+    } catch {
+      // fallback below
+    }
+
+    if (!loadedSpeciesFromParquet) {
+      const speciesRes = await fetch(import.meta.env.BASE_URL + 'data/species_data.json')
+      if (speciesRes.ok) {
+        const speciesJson = await speciesRes.text()
+        await db.registerFileText('species.json', speciesJson)
+        await conn.query(`
+          INSERT INTO species_enrichment
+          SELECT
+            species,
+            tree_category,
+            native_status,
+            is_evergreen,
+            mature_height_ft,
+            bloom_season,
+            wildlife_value,
+            fire_risk
+          FROM read_json_auto('species.json')
+        `)
+      }
+    }
+  } catch (e) {
+    console.warn('[Perf] duckdb-worker:species-load:failed', e)
+  }
+
+  let loadedTreesFastFromParquet = false
+  try {
+    const treesFastRes = await fetch(import.meta.env.BASE_URL + 'data/cache/trees_fast.parquet')
+    if (treesFastRes.ok) {
+      const buffer = new Uint8Array(await treesFastRes.arrayBuffer())
+      await db.registerFileBuffer('trees_fast.parquet', buffer)
+      await conn.query(`CREATE OR REPLACE TABLE trees_fast AS SELECT * FROM read_parquet('trees_fast.parquet')`)
+      loadedTreesFastFromParquet = true
+    }
+  } catch {
+    // fallback below
+  }
+
+  if (!loadedTreesFastFromParquet) {
+    await conn.query(`
+    CREATE OR REPLACE TABLE trees_fast AS
+    WITH joined AS (
+      SELECT
+        t.tree_id,
+        t.common_name,
+        t.site_info,
+        t.plant_date,
+        t.species,
+        t.latitude,
+        t.longitude,
+        COALESCE(t.diameter_at_breast_height, 3) AS dbh,
+        CASE lower(trim(COALESCE(se.tree_category, 'default')))
+          WHEN 'palm' THEN 'palm'
+          WHEN 'broadleaf' THEN 'broadleaf'
+          WHEN 'spreading' THEN 'spreading'
+          WHEN 'coniferous' THEN 'coniferous'
+          WHEN 'columnar' THEN 'columnar'
+          WHEN 'ornamental' THEN 'ornamental'
+          ELSE 'default'
+        END AS tree_category,
+        se.native_status,
+        se.is_evergreen,
+        se.mature_height_ft,
+        se.bloom_season,
+        se.wildlife_value,
+        se.fire_risk,
+        LEAST(GREATEST(t.latitude, -85.05112878), 85.05112878) AS latitude_clamped,
+        ((t.longitude + 180.0) / 360.0) AS x_norm,
+        ((1.0 - ln(tan(radians(LEAST(GREATEST(t.latitude, -85.05112878), 85.05112878))) + (1.0 / cos(radians(LEAST(GREATEST(t.latitude, -85.05112878), 85.05112878))))) / pi()) / 2.0) AS y_norm
+      FROM trees t
+      LEFT JOIN species_enrichment se
+        ON t.species = se.species
+      WHERE t.latitude IS NOT NULL
+        AND t.longitude IS NOT NULL
+    )
+    SELECT
+      tree_id,
+      common_name,
+      site_info,
+      plant_date,
+      species,
+      latitude,
+      longitude,
+      TRY_CAST(dbh AS DOUBLE) AS dbh,
+      tree_category,
+      native_status,
+      is_evergreen,
+      mature_height_ft,
+      bloom_season,
+      wildlife_value,
+      fire_risk,
+      ((longitude * ${WEB_MERCATOR_MAX}) / 180.0) AS x_3857,
+      (6378137.0 * ln(tan(pi() / 4.0 + radians(latitude_clamped) / 2.0))) AS y_3857,
+      CAST(floor(x_norm * pow(2, 13)) AS INTEGER) AS xtile_z13,
+      CAST(floor(y_norm * pow(2, 13)) AS INTEGER) AS ytile_z13,
+      CAST(floor(x_norm * pow(2, 14)) AS INTEGER) AS xtile_z14,
+      CAST(floor(y_norm * pow(2, 14)) AS INTEGER) AS ytile_z14,
+      CAST(floor(x_norm * pow(2, 15)) AS INTEGER) AS xtile_z15,
+      CAST(floor(y_norm * pow(2, 15)) AS INTEGER) AS ytile_z15,
+      CAST(floor(x_norm * pow(2, 16)) AS INTEGER) AS xtile_z16,
+      CAST(floor(y_norm * pow(2, 16)) AS INTEGER) AS ytile_z16,
+      CAST(floor(x_norm * pow(2, 17)) AS INTEGER) AS xtile_z17,
+      CAST(floor(y_norm * pow(2, 17)) AS INTEGER) AS ytile_z17,
+      CAST(floor(x_norm * pow(2, 18)) AS INTEGER) AS xtile_z18,
+      CAST(floor(y_norm * pow(2, 18)) AS INTEGER) AS ytile_z18,
+      CAST(floor(x_norm * pow(2, 19)) AS INTEGER) AS xtile_z19,
+      CAST(floor(y_norm * pow(2, 19)) AS INTEGER) AS ytile_z19,
+      CAST(floor(x_norm * pow(2, 20)) AS INTEGER) AS xtile_z20,
+      CAST(floor(y_norm * pow(2, 20)) AS INTEGER) AS ytile_z20
+    FROM joined
+  `)
+  }
+
+  hasAggCacheByZoom.clear()
+  for (const z of [14]) {
+    try {
+      // Rebuild aggregate cache from trees_fast with category breakout so
+      // aggregated circles preserve effective color, not just default green.
+      const gridM = baseSimplifyGridMetersForZoom(z)
+      if (gridM <= 0) continue
+      await conn.query(`
+        CREATE OR REPLACE TABLE agg_z${z}_cache AS
+        SELECT
+          xtile_z${z} AS xtile,
+          ytile_z${z} AS ytile,
+          floor(x_3857 / ${gridM}) * ${gridM} + ${gridM} / 2.0 AS gx,
+          floor(y_3857 / ${gridM}) * ${gridM} + ${gridM} / 2.0 AS gy,
+          COALESCE(tree_category, 'default') AS category,
+          AVG(TRY_CAST(dbh AS DOUBLE)) AS dbh,
+          COUNT(*) AS point_count
+        FROM trees_fast
+        GROUP BY 1, 2, 3, 4, 5
+      `)
+      hasAggCacheByZoom.add(z)
+    } catch {
+      // runtime fallback stays active
+    }
+  }
+
+  dataTileBoundsByZoom.clear()
+  for (let z = 13; z <= 20; z += 1) {
+    const result = await conn.query(`
+      SELECT
+        MIN(xtile_z${z}) AS min_x,
+        MAX(xtile_z${z}) AS max_x,
+        MIN(ytile_z${z}) AS min_y,
+        MAX(ytile_z${z}) AS max_y
+      FROM trees_fast
+    `)
+    const row = result.toArray()[0] as Record<string, unknown> | undefined
+    if (!row) continue
+    const minX = Number(row.min_x)
+    const maxX = Number(row.max_x)
+    const minY = Number(row.min_y)
+    const maxY = Number(row.max_y)
+    if ([minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) {
+      dataTileBoundsByZoom.set(z, { minX, maxX, minY, maxY })
+    }
+  }
+
+  spatialExtensionReady = false
+  try {
+    await conn.query('LOAD spatial;')
+    spatialExtensionReady = true
+  } catch {
+    try {
+      await conn.query('INSTALL spatial;')
+      await conn.query('LOAD spatial;')
+      spatialExtensionReady = true
+    } catch (e) {
+      console.error('DuckDB spatial extension unavailable:', e)
+    }
+  }
+
+  ready = true
+  initError = null
+  console.info('[Perf] duckdb-worker:init:done', { ms: Math.round(nowMs() - t0) })
+}
+
+async function ensureInit(): Promise<void> {
+  if (ready) return
+  if (!initPromise) {
+    initPromise = doInit().catch((e) => {
+      initError = (e as Error).message
+      ready = false
+      throw e
+    })
+  }
+  await initPromise
+}
+
+async function ensurePreparedFeatureTableForZoom(z: number, baseQuery: string): Promise<void> {
+  if (!conn || z !== 15) return
+
+  const rev = tileQueryRevision
+  if (preparedFeatureTableRevisionByZoom.get(z) === rev) return
+
+  const key = featureTableBuildKey(rev, z)
+  const inflight = inflightFeatureTableBuild.get(key)
+  if (inflight) {
+    await inflight
+    return
+  }
+
+  const xExpr = tileXExpr('tf', z)
+  const yExpr = tileYExpr('tf', z)
+  const table = featureTableName(z)
+
+  const request = (async () => {
+    const sql = `
+CREATE OR REPLACE TEMP TABLE ${table} AS
+WITH base AS (
+  ${baseQuery}
+), rows AS (
+  SELECT
+    ${xExpr} AS xtile,
+    ${yExpr} AS ytile,
+    {
+      'geom': ST_AsMVTGeom(
+        ST_Point(tf.x_3857, tf.y_3857),
+        ST_Extent(ST_TileEnvelope(${z}, ${xExpr}, ${yExpr})),
+        4096,
+        64,
+        true
+      ),
+      'id': COALESCE(base.tree_id, tf.tree_id, 0),
+      'dbh': TRY_CAST(COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS DOUBLE),
+      'category': COALESCE(tf.tree_category, 'default'),
+      'rotation': 0,
+      'point_count': 1,
+      'grid_m': 32
+    } AS feature
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+)
+SELECT xtile, ytile, feature
+FROM rows
+WHERE xtile >= 0
+  AND ytile >= 0
+  AND xtile < CAST(pow(2, ${z}) AS INTEGER)
+  AND ytile < CAST(pow(2, ${z}) AS INTEGER)
+  AND feature.geom IS NOT NULL
+  AND NOT ST_IsEmpty(feature.geom)
+`
+    await conn.query(sql)
+    if (rev === tileQueryRevision) preparedFeatureTableRevisionByZoom.set(z, rev)
+  })()
+
+  inflightFeatureTableBuild.set(key, request)
+  try {
+    await request
+  } finally {
+    inflightFeatureTableBuild.delete(key)
+  }
+}
+
+async function ensureNeighborhoodBatchTiles(z: number, x: number, y: number, baseQuery: string): Promise<void> {
+  if (!conn) return
+  const blockSize = neighborhoodBlockSizeForZoom(z)
+  if (blockSize <= 1) return
+
+  const rev = tileQueryRevision
+  const tileCount = Math.pow(2, z)
+  const blockX = Math.floor(x / blockSize)
+  const blockY = Math.floor(y / blockSize)
+  let minX = Math.max(0, blockX * blockSize)
+  let maxX = Math.min(tileCount - 1, minX + blockSize - 1)
+  let minY = Math.max(0, blockY * blockSize)
+  let maxY = Math.min(tileCount - 1, minY + blockSize - 1)
+
+  const visibleRange = getVisibleTileRange(z)
+  if (visibleRange) {
+    minX = visibleRange.minX
+    maxX = visibleRange.maxX
+    minY = visibleRange.minY
+    maxY = visibleRange.maxY
+  }
+
+  const dataBounds = getDataTileBounds(z)
+  if (dataBounds) {
+    minX = Math.max(minX, dataBounds.minX)
+    maxX = Math.min(maxX, dataBounds.maxX)
+    minY = Math.max(minY, dataBounds.minY)
+    maxY = Math.min(maxY, dataBounds.maxY)
+  }
+
+  if (minX > maxX || minY > maxY) {
+    setCachedTile(tileCacheKeyForRevision(rev, z, x, y), new Uint8Array())
+    return
+  }
+
+  const bKey = neighborhoodBatchKey(rev, z, minX, maxX, minY, maxY)
+  const inflight = inflightNeighborhoodBatch.get(bKey)
+  if (inflight) {
+    await inflight
+    return
+  }
+
+  const request = (async () => {
+    const sql = z === 15 ? `
+WITH rows AS (
+  SELECT
+    xtile,
+    ytile,
+    feature
+  FROM ${featureTableName(15)}
+  WHERE xtile BETWEEN ${minX} AND ${maxX}
+    AND ytile BETWEEN ${minY} AND ${maxY}
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geom') AS mvt
+FROM rows
+GROUP BY xtile, ytile
+` : `
+WITH base AS (
+  ${baseQuery}
+), pts AS (
+  SELECT
+    tf.x_3857,
+    tf.y_3857,
+    COALESCE(base.tree_id, tf.tree_id, 0) AS id,
+    COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh,
+    COALESCE(tf.tree_category, 'default') AS category,
+    0 AS rotation,
+    ${tileXExpr('tf', z)} AS xtile,
+    ${tileYExpr('tf', z)} AS ytile
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+  WHERE ${tileXExpr('tf', z)} BETWEEN ${minX} AND ${maxX}
+    AND ${tileYExpr('tf', z)} BETWEEN ${minY} AND ${maxY}
+), rows AS (
+  SELECT
+    xtile,
+    ytile,
+    {
+      'geom': ST_AsMVTGeom(
+        ST_Point(x_3857, y_3857),
+        ST_Extent(ST_TileEnvelope(${z}, xtile, ytile)),
+        4096,
+        64,
+        true
+      ),
+      'id': id,
+      'dbh': TRY_CAST(dbh AS DOUBLE),
+      'category': category,
+      'rotation': rotation,
+      'point_count': 1,
+      'grid_m': 32
+    } AS feature
+  FROM pts
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geom') AS mvt
+FROM rows
+WHERE feature.geom IS NOT NULL AND NOT ST_IsEmpty(feature.geom)
+GROUP BY xtile, ytile
+`
+
+    const result = await conn.query(sql)
+    const rows = result.toArray()
+
+    if (rev === tileQueryRevision) {
+      for (let tx = minX; tx <= maxX; tx += 1) {
+        for (let ty = minY; ty <= maxY; ty += 1) {
+          setCachedTile(tileCacheKeyForRevision(rev, z, tx, ty), new Uint8Array())
+        }
+      }
+      for (const row of rows) {
+        const xtile = Number(row.xtile)
+        const ytile = Number(row.ytile)
+        const raw = row.mvt as Uint8Array | undefined
+        const tile = !raw || raw.length === 0
+          ? new Uint8Array()
+          : new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))
+        setCachedTile(tileCacheKeyForRevision(rev, z, xtile, ytile), tile)
+      }
+    }
+  })()
+
+  inflightNeighborhoodBatch.set(bKey, request)
+  try {
+    await request
+  } finally {
+    inflightNeighborhoodBatch.delete(bKey)
+  }
+}
+
+async function ensureZoomBatchTiles(z: number, baseQuery: string, simplifyGridMeters: number): Promise<void> {
+  if (!conn) return
+  const rev = tileQueryRevision
+  const bKey = zoomBatchKey(rev, z)
+  if (zoomBatchReady.has(bKey)) return
+
+  const inflight = inflightZoomBatch.get(bKey)
+  if (inflight) {
+    await inflight
+    return
+  }
+
+  const bounds = getDataTileBounds(z)
+  const boundedFilter = bounds
+    ? `WHERE xtile BETWEEN ${bounds.minX} AND ${bounds.maxX}\n    AND ytile BETWEEN ${bounds.minY} AND ${bounds.maxY}`
+    : `WHERE xtile >= 0\n    AND ytile >= 0\n    AND xtile < CAST(pow(2, ${z}) AS INTEGER)\n    AND ytile < CAST(pow(2, ${z}) AS INTEGER)`
+  const useAggCache = simplifyGridMeters > 0 && hasAggCacheByZoom.has(z) && isDefaultBaseQuery(baseQuery)
+
+  const request = (async () => {
+    const sql = useAggCache ? `
+WITH agg AS (
+  SELECT
+    xtile,
+    ytile,
+    gx,
+    gy,
+    category,
+    dbh,
+    point_count
+  FROM agg_z${z}_cache
+  ${boundedFilter}
+), rows AS (
+  SELECT
+    xtile,
+    ytile,
+    {
+      'geometry': ST_AsMVTGeom(
+        ST_Point(gx, gy),
+        ST_Extent(ST_TileEnvelope(${z}, xtile, ytile)),
+        4096,
+        64,
+        true
+      ),
+      'id': -1,
+      'dbh': TRY_CAST(dbh AS DOUBLE),
+      'category': COALESCE(category, 'default'),
+      'rotation': 0,
+      'point_count': TRY_CAST(point_count AS INTEGER),
+      'grid_m': ${simplifyGridMeters}
+    } AS feature
+  FROM agg
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geometry') AS mvt
+FROM rows
+WHERE feature.geometry IS NOT NULL AND NOT ST_IsEmpty(feature.geometry)
+GROUP BY xtile, ytile
+` : simplifyGridMeters > 0 ? `
+WITH base AS (
+  ${baseQuery}
+), pts AS (
+  SELECT
+    tf.x_3857,
+    tf.y_3857,
+    COALESCE(tf.tree_category, 'default') AS category,
+    COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh,
+    ${tileXExpr('tf', z)} AS xtile,
+    ${tileYExpr('tf', z)} AS ytile
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+), bounded AS (
+  SELECT *
+  FROM pts
+  ${boundedFilter}
+), agg AS (
+  SELECT
+    xtile,
+    ytile,
+    floor(x_3857 / ${simplifyGridMeters}) * ${simplifyGridMeters} + ${simplifyGridMeters} / 2.0 AS gx,
+    floor(y_3857 / ${simplifyGridMeters}) * ${simplifyGridMeters} + ${simplifyGridMeters} / 2.0 AS gy,
+    category,
+    AVG(dbh) AS dbh,
+    COUNT(*) AS point_count
+  FROM bounded
+  GROUP BY 1, 2, 3, 4, 5
+), rows AS (
+  SELECT
+    xtile,
+    ytile,
+    {
+      'geometry': ST_AsMVTGeom(
+        ST_Point(gx, gy),
+        ST_Extent(ST_TileEnvelope(${z}, xtile, ytile)),
+        4096,
+        64,
+        true
+      ),
+      'id': -1,
+      'dbh': TRY_CAST(dbh AS DOUBLE),
+      'category': COALESCE(category, 'default'),
+      'rotation': 0,
+      'point_count': TRY_CAST(point_count AS INTEGER),
+      'grid_m': ${simplifyGridMeters}
+    } AS feature
+  FROM agg
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geometry') AS mvt
+FROM rows
+WHERE feature.geometry IS NOT NULL AND NOT ST_IsEmpty(feature.geometry)
+GROUP BY xtile, ytile
+` : `
+WITH base AS (
+  ${baseQuery}
+), points AS (
+  SELECT
+    tf.x_3857,
+    tf.y_3857,
+    COALESCE(base.tree_id, tf.tree_id, 0) AS id,
+    COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh,
+    COALESCE(tf.tree_category, 'default') AS category,
+    0 AS rotation,
+    ${tileXExpr('tf', z)} AS xtile,
+    ${tileYExpr('tf', z)} AS ytile
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+), bounded AS (
+  SELECT *
+  FROM points
+  ${boundedFilter}
+), rows AS (
+  SELECT
+    xtile,
+    ytile,
+    {
+      'geom': ST_AsMVTGeom(
+        ST_Point(x_3857, y_3857),
+        ST_Extent(ST_TileEnvelope(${z}, xtile, ytile)),
+        4096,
+        64,
+        true
+      ),
+      'id': id,
+      'dbh': TRY_CAST(dbh AS DOUBLE),
+      'category': category,
+      'rotation': rotation,
+      'point_count': 1,
+      'grid_m': 32
+    } AS feature
+  FROM bounded
+)
+SELECT
+  xtile,
+  ytile,
+  ST_AsMVT(feature, 'trees', 4096, 'geom') AS mvt
+FROM rows
+WHERE feature.geom IS NOT NULL AND NOT ST_IsEmpty(feature.geom)
+GROUP BY xtile, ytile
+`
+
+    const result = await conn.query(sql)
+    const rows = result.toArray()
+    if (rev === tileQueryRevision) {
+      for (const row of rows) {
+        const xtile = Number(row.xtile)
+        const ytile = Number(row.ytile)
+        const raw = row.mvt as Uint8Array | undefined
+        const tile = !raw || raw.length === 0
+          ? new Uint8Array()
+          : new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))
+        setCachedTile(tileCacheKeyForRevision(rev, z, xtile, ytile), tile)
+      }
+      zoomBatchReady.add(bKey)
+    }
+  })()
+
+  inflightZoomBatch.set(bKey, request)
+  try {
+    await request
+  } finally {
+    inflightZoomBatch.delete(bKey)
+  }
+}
+
+async function generatePointTileMvt(z: number, x: number, y: number): Promise<Uint8Array> {
+  if (!conn) return new Uint8Array()
+
+  const key = tileCacheKey(z, x, y)
+  if (isTileOutsideDataBounds(z, x, y)) return new Uint8Array()
+
+  if (activeViewportZoom >= 16 && z <= 12) return new Uint8Array()
+
+  const cached = getCachedTile(key)
+  if (cached) return cached
+
+  const inflight = inflightTileRequests.get(key)
+  if (inflight) return inflight
+
+  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  const { simplifyGridMeters } = adaptiveLodForTile(z, x, y)
+  const bounds = tileBounds3857(z, x, y)
+  const batchKey = zoomBatchKey(tileQueryRevision, z)
+
+  if (shouldUseZoomBatch(z)) {
+    await ensureZoomBatchTiles(z, baseQuery, simplifyGridMeters)
+    const batched = getCachedTile(key)
+    if (batched) return batched
+    if (zoomBatchReady.has(batchKey)) {
+      const emptyTile = new Uint8Array()
+      setCachedTile(key, emptyTile)
+      return new Uint8Array(emptyTile)
+    }
+  }
+
+  if (simplifyGridMeters === 0 && z >= 15) {
+    await ensurePreparedFeatureTableForZoom(z, baseQuery)
+    await ensureNeighborhoodBatchTiles(z, x, y, baseQuery)
+    const neighborBatched = getCachedTile(key)
+    if (neighborBatched) return neighborBatched
+  }
+
+  const request = (async () => {
+    const sql = simplifyGridMeters > 0 ? `
+WITH base AS (
+  ${baseQuery}
+), pts AS (
+  SELECT
+    tf.x_3857,
+    tf.y_3857,
+    COALESCE(tf.tree_category, 'default') AS category,
+    COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+  WHERE tf.x_3857 BETWEEN ${bounds.minX} AND ${bounds.maxX}
+    AND tf.y_3857 BETWEEN ${bounds.minY} AND ${bounds.maxY}
+), agg AS (
+  SELECT
+    floor(x_3857 / ${simplifyGridMeters}) * ${simplifyGridMeters} + ${simplifyGridMeters} / 2.0 AS gx,
+    floor(y_3857 / ${simplifyGridMeters}) * ${simplifyGridMeters} + ${simplifyGridMeters} / 2.0 AS gy,
+    category,
+    AVG(dbh) AS dbh,
+    COUNT(*) AS point_count
+  FROM pts
+  GROUP BY 1, 2, 3
+), tiles AS (
+  SELECT {
+    'geometry': ST_AsMVTGeom(
+      ST_Point(gx, gy),
+      ST_Extent(ST_TileEnvelope(${z}, ${x}, ${y})),
+      4096,
+      64,
+      true
+    ),
+    'id': -1,
+    'dbh': TRY_CAST(dbh AS DOUBLE),
+    'category': COALESCE(category, 'default'),
+    'rotation': 0,
+    'point_count': TRY_CAST(point_count AS INTEGER),
+    'grid_m': ${simplifyGridMeters}
+  } AS feature
+  FROM agg
+)
+SELECT ST_AsMVT(feature, 'trees', 4096, 'geometry') AS mvt
+FROM tiles
+WHERE feature.geometry IS NOT NULL AND NOT ST_IsEmpty(feature.geometry)
+` : `
+WITH base AS (
+  ${baseQuery}
+), points AS (
+  SELECT
+    COALESCE(base.tree_id, tf.tree_id, 0) AS id,
+    COALESCE(base.diameter_at_breast_height, tf.dbh, 3) AS dbh,
+    COALESCE(tf.tree_category, 'default') AS category,
+    0 AS rotation,
+    1 AS point_count,
+    32 AS grid_m,
+    ST_AsMVTGeom(
+      ST_Point(tf.x_3857, tf.y_3857),
+      ST_Extent(ST_TileEnvelope(${z}, ${x}, ${y})),
+      4096,
+      64,
+      true
+    ) AS geom
+  FROM base
+  INNER JOIN trees_fast tf
+    ON base.tree_id = tf.tree_id
+  WHERE tf.x_3857 BETWEEN ${bounds.minX} AND ${bounds.maxX}
+    AND tf.y_3857 BETWEEN ${bounds.minY} AND ${bounds.maxY}
+  LIMIT 50000
+)
+SELECT ST_AsMVT(points, 'trees', 4096, 'geom') AS mvt
+FROM points
+WHERE geom IS NOT NULL
+`
+
+    const result = await conn.query(sql)
+    const raw = result.get(0)?.mvt as Uint8Array | undefined
+    const tile = !raw || raw.length === 0
+      ? new Uint8Array()
+      : new Uint8Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))
+    setCachedTile(key, tile)
+    return new Uint8Array(tile)
+  })()
+
+  inflightTileRequests.set(key, request)
+  try {
+    return await request
+  } finally {
+    inflightTileRequests.delete(key)
+  }
+}
+
+function setTileQuery(sql: string | null) {
+  tileQuerySql = sql
+  tileQueryRevision += 1
+  tileCache.clear()
+  emptyTileKeys.clear()
+  inflightTileRequests.clear()
+  zoomBatchReady.clear()
+  inflightZoomBatch.clear()
+  inflightNeighborhoodBatch.clear()
+  preparedFeatureTableRevisionByZoom.clear()
+  inflightFeatureTableBuild.clear()
+  visibleTileRangeByZoom.clear()
+  prefetchedVisibleRangeSigByZoom.clear()
+  prewarmDoneRevision = -1
+  prewarmPromise = null
+}
+
+function setViewportZoom(zoom: number) {
+  if (!Number.isFinite(zoom)) return
+  activeViewportZoom = zoom
+}
+
+function setViewportCenter(lng: number, lat: number) {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+  activeViewportCenter = { lng, lat }
+}
+
+function setVisibleTileRange(z: number, minX: number, maxX: number, minY: number, maxY: number) {
+  if (![z, minX, maxX, minY, maxY].every((v) => Number.isFinite(v))) return
+  visibleTileRangeByZoom.set(z, {
+    minX: Math.floor(Math.min(minX, maxX)),
+    maxX: Math.floor(Math.max(minX, maxX)),
+    minY: Math.floor(Math.min(minY, maxY)),
+    maxY: Math.floor(Math.max(minY, maxY)),
+  })
+}
+
+async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<PrefetchStatus> {
+  await ensureInit()
+  if (!conn || !spatialExtensionReady || z < 15) return 'skipped'
+
+  const range = getVisibleTileRange(z)
+  if (!range) return 'skipped'
+
+  const sig = `${tileQueryRevision}:${z}:${range.minX}-${range.maxX}:${range.minY}-${range.maxY}`
+  if (prefetchedVisibleRangeSigByZoom.get(z) === sig) return 'deduped'
+
+  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  if (z === 15) {
+    await ensurePreparedFeatureTableForZoom(15, baseQuery)
+  }
+
+  const centerX = Math.floor((range.minX + range.maxX) / 2)
+  const centerY = Math.floor((range.minY + range.maxY) / 2)
+  await ensureNeighborhoodBatchTiles(z, centerX, centerY, baseQuery)
+  prefetchedVisibleRangeSigByZoom.set(z, sig)
+  return 'executed'
+}
+
+async function prewarmLodCaches(): Promise<void> {
+  await ensureInit()
+  if (!conn || !spatialExtensionReady) return
+
+  const rev = tileQueryRevision
+  if (prewarmDoneRevision === rev) return
+  if (prewarmPromise) {
+    await prewarmPromise
+    return
+  }
+
+  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  prewarmPromise = (async () => {
+    const viewport = activeViewportCenter
+    const focusZoom = Math.max(15, Math.min(19, Math.round(activeViewportZoom)))
+
+    if (viewport) {
+      const cFocus = lngLatToTile(viewport.lng, viewport.lat, focusZoom)
+      await ensureNeighborhoodBatchTiles(focusZoom, cFocus.x, cFocus.y, baseQuery)
+
+      const zMinusOne = focusZoom - 1
+      if (zMinusOne >= 15) {
+        const cMinusOne = lngLatToTile(viewport.lng, viewport.lat, zMinusOne)
+        await ensureNeighborhoodBatchTiles(zMinusOne, cMinusOne.x, cMinusOne.y, baseQuery)
+      }
+    }
+
+    await ensurePreparedFeatureTableForZoom(15, baseQuery)
+    if (viewport) {
+      const c15 = lngLatToTile(viewport.lng, viewport.lat, 15)
+      await ensureNeighborhoodBatchTiles(15, c15.x, c15.y, baseQuery)
+    }
+
+    await ensureZoomBatchTiles(14, baseQuery, 32)
+    await ensureZoomBatchTiles(13, baseQuery, 32)
+
+    if (tileQueryRevision === rev) {
+      prewarmDoneRevision = rev
+    }
+  })()
+
+  try {
+    await prewarmPromise
+  } finally {
+    prewarmPromise = null
+  }
+}
+
+function setAutoTileFetchEnabled(enabled: boolean) {
+  autoTileFetchEnabled = !!enabled
+}
+
+function normalizeValue(v: unknown): unknown {
+  if (typeof v === 'bigint') {
+    const n = Number(v)
+    return Number.isSafeInteger(n) ? n : v.toString()
+  }
+  if (v instanceof Uint8Array) {
+    return Array.from(v)
+  }
+  return v
+}
+
+async function runQuery(sql: string): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> {
+  await ensureInit()
+  if (!conn) throw new Error('DuckDB not initialized')
+
+  const result = await conn.query(sql)
+  const columns = result.schema.fields.map((f) => f.name)
+  const rows = result.toArray().map((row) => {
+    const obj: Record<string, unknown> = {}
+    for (const col of columns) {
+      obj[col] = normalizeValue(row[col])
+    }
+    return obj
+  })
+  return { columns, rows }
+}
+
+async function getTile(z: number, x: number, y: number): Promise<Uint8Array> {
+  await ensureInit()
+  if (!autoTileFetchEnabled) {
+    const cached = getCachedTile(tileCacheKey(z, x, y))
+    return cached ?? new Uint8Array()
+  }
+  return queueTileRequest(z, x, y)
+}
+
+type WorkerMethodMap = {
+  ensureInit: { params: Record<string, never>; result: { ready: boolean; initError: string | null } }
+  setTileQuery: { params: { sql: string | null }; result: void }
+  setViewportZoom: { params: { zoom: number }; result: void }
+  setViewportCenter: { params: { lng: number; lat: number }; result: void }
+  setVisibleTileRange: { params: { z: number; minX: number; maxX: number; minY: number; maxY: number }; result: void }
+  prefetchVisibleDetailTilesAtZoom: { params: { z: number }; result: PrefetchStatus }
+  prewarmLodCaches: { params: Record<string, never>; result: void }
+  setAutoTileFetchEnabled: { params: { enabled: boolean }; result: void }
+  query: { params: { sql: string }; result: { columns: string[]; rows: Record<string, unknown>[] } }
+  getTile: { params: { z: number; x: number; y: number }; result: { tileBuffer: ArrayBuffer } }
+}
+
+type WorkerRequest = {
+  type: 'request'
+  requestId: number
+  method: keyof WorkerMethodMap
+  params: unknown
+}
+
+type WorkerResponse = {
+  type: 'response'
+  requestId: number
+  ok: boolean
+  result?: unknown
+  error?: string
+}
+
+type WorkerContext = {
+  onmessage: ((event: MessageEvent<WorkerRequest>) => void) | null
+  postMessage: (message: unknown, transfer?: Transferable[]) => void
+}
+
+const ctx = self as unknown as WorkerContext
+
+ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  const msg = event.data
+  if (!msg || msg.type !== 'request') return
+
+  const send = (payload: WorkerResponse, transfer?: Transferable[]) => {
+    if (transfer && transfer.length > 0) {
+      ctx.postMessage(payload, transfer)
+    } else {
+      ctx.postMessage(payload)
+    }
+  }
+
+  try {
+    switch (msg.method) {
+      case 'ensureInit': {
+        await ensureInit()
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: { ready, initError } })
+        break
+      }
+      case 'setTileQuery': {
+        const { sql } = msg.params as WorkerMethodMap['setTileQuery']['params']
+        setTileQuery(sql)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'setViewportZoom': {
+        const { zoom } = msg.params as WorkerMethodMap['setViewportZoom']['params']
+        setViewportZoom(zoom)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'setViewportCenter': {
+        const { lng, lat } = msg.params as WorkerMethodMap['setViewportCenter']['params']
+        setViewportCenter(lng, lat)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'setVisibleTileRange': {
+        const { z, minX, maxX, minY, maxY } = msg.params as WorkerMethodMap['setVisibleTileRange']['params']
+        setVisibleTileRange(z, minX, maxX, minY, maxY)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'prefetchVisibleDetailTilesAtZoom': {
+        const { z } = msg.params as WorkerMethodMap['prefetchVisibleDetailTilesAtZoom']['params']
+        const status = await prefetchVisibleDetailTilesAtZoom(z)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: status })
+        break
+      }
+      case 'prewarmLodCaches': {
+        await prewarmLodCaches()
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'setAutoTileFetchEnabled': {
+        const { enabled } = msg.params as WorkerMethodMap['setAutoTileFetchEnabled']['params']
+        setAutoTileFetchEnabled(enabled)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'query': {
+        const { sql } = msg.params as WorkerMethodMap['query']['params']
+        const result = await runQuery(sql)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result })
+        break
+      }
+      case 'getTile': {
+        const { z, x, y } = msg.params as WorkerMethodMap['getTile']['params']
+        const tile = await getTile(z, x, y)
+        const clone = new Uint8Array(tile)
+        send(
+          { type: 'response', requestId: msg.requestId, ok: true, result: { tileBuffer: clone.buffer } },
+          [clone.buffer],
+        )
+        break
+      }
+      default:
+        send({ type: 'response', requestId: msg.requestId, ok: false, error: `Unknown method: ${String(msg.method)}` })
+    }
+  } catch (e) {
+    const err = e as Error
+    send({
+      type: 'response',
+      requestId: msg.requestId,
+      ok: false,
+      error: err?.message ?? String(e),
+    })
+  }
+}
+
+export {}

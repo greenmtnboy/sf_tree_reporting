@@ -1,3 +1,6 @@
+export { useDuckDB } from './useDuckDBClient'
+
+/*
 import { ref } from 'vue'
 import * as duckdb from '@duckdb/duckdb-wasm'
 import maplibregl from 'maplibre-gl'
@@ -1517,3 +1520,5 @@ export function useDuckDB() {
     setAutoTileFetchEnabled,
   }
 }
+
+*/

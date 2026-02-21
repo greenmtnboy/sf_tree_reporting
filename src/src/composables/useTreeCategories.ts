@@ -216,22 +216,18 @@ export function registerTreeIcons(map: maplibregl.Map, categoryIcons: CategoryIc
   // Prefer enriched, pre-baked RGBA icons when available
   for (const icon of categoryIcons) {
     const imageName = `tree-${icon.category}`
-    try {
-      const decoded = decodeBase64ToU8(icon.rgbaBase64)
-      const expectedLen = icon.width * icon.height * 4
-      if (decoded.length !== expectedLen) continue
-      const image = {
-        width: icon.width,
-        height: icon.height,
-        data: decoded,
-      }
-      if (map.hasImage(imageName)) {
-        map.updateImage(imageName, image)
-      } else {
-        map.addImage(imageName, image)
-      }
-    } catch {
-      // Ignore malformed icon rows and fall back to canvas icon below
+    const decoded = decodeBase64ToU8(icon.rgbaBase64)
+    const expectedLen = icon.width * icon.height * 4
+    if (decoded.length !== expectedLen) continue
+    const image = {
+      width: icon.width,
+      height: icon.height,
+      data: decoded,
+    }
+    if (map.hasImage(imageName)) {
+      map.updateImage(imageName, image)
+    } else {
+      map.addImage(imageName, image)
     }
   }
 
