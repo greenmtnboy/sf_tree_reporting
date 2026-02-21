@@ -108,6 +108,15 @@ function tileCacheKeyForRevision(rev: number, z: number, x: number, y: number): 
   return `${rev}:${z}/${x}/${y}`
 }
 
+function zoomFromTileCacheKey(key: string): number | null {
+  const sep = key.indexOf(':')
+  if (sep < 0) return null
+  const slash = key.indexOf('/', sep + 1)
+  if (slash < 0) return null
+  const z = Number(key.slice(sep + 1, slash))
+  return Number.isFinite(z) ? z : null
+}
+
 function zoomBatchKey(rev: number, z: number): string {
   return `${rev}:${z}`
 }
@@ -279,6 +288,16 @@ function getCachedTile(key: string): Uint8Array | null {
 
 function setCachedTile(key: string, tile: Uint8Array): void {
   if (tile.byteLength === 0) {
+    const z = zoomFromTileCacheKey(key)
+    // Detailed zooms (15+) are more susceptible to transient empty responses
+    // during camera motion/range churn. Avoid pinning those misses as
+    // long-lived empty cache entries, which can manifest as blank segments.
+    if (z != null && z >= 15) {
+      emptyTileKeys.delete(key)
+      if (tileCache.has(key)) tileCache.delete(key)
+      return
+    }
+
     emptyTileKeys.add(key)
     if (tileCache.has(key)) tileCache.delete(key)
     return

@@ -1026,7 +1026,11 @@ onMounted(() => {
   map.on('load', () => {
     console.info('[Perf] map:style:load', { ms: Math.round(nowMs() - mapInitStartedAt) })
     updateZoomLevel()
-    registerTreeIcons(map!, categoryIcons.value)
+    try {
+      registerTreeIcons(map!, categoryIcons.value)
+    } catch (e) {
+      console.warn('[TreeIcons] registration failed during map load', e)
+    }
     console.info('[Perf] map:icons:registered', { ms: Math.round(nowMs() - mapInitStartedAt) })
 
     map!.on('sourcedata', (e) => {
@@ -1065,6 +1069,13 @@ onMounted(() => {
 
     map!.on('styleimagemissing', (e) => {
       logIconLayerDebug('style-image-missing', { id: e.id })
+      if (e.id.startsWith('tree-')) {
+        try {
+          registerTreeIcons(map!, categoryIcons.value)
+        } catch (err) {
+          console.warn('[TreeIcons] recovery registration failed', err)
+        }
+      }
     })
 
     map!.on('moveend', () => {
@@ -1092,7 +1103,11 @@ onMounted(() => {
 
 watch(categoryIcons, (icons) => {
   if (!map?.loaded()) return
-  registerTreeIcons(map, icons)
+  try {
+    registerTreeIcons(map, icons)
+  } catch (e) {
+    console.warn('[TreeIcons] registration failed after category icon update', e)
+  }
 })
 
 // If data loads after map is ready

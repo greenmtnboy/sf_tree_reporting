@@ -216,30 +216,46 @@ export function registerTreeIcons(map: maplibregl.Map, categoryIcons: CategoryIc
   // Prefer enriched, pre-baked RGBA icons when available
   for (const icon of categoryIcons) {
     const imageName = `tree-${icon.category}`
-    const decoded = decodeBase64ToU8(icon.rgbaBase64)
-    const expectedLen = icon.width * icon.height * 4
-    if (decoded.length !== expectedLen) continue
-    const image = {
-      width: icon.width,
-      height: icon.height,
-      data: decoded,
-    }
-    if (map.hasImage(imageName)) {
-      map.updateImage(imageName, image)
-    } else {
-      map.addImage(imageName, image)
+    try {
+      const decoded = decodeBase64ToU8(icon.rgbaBase64)
+      const expectedLen = icon.width * icon.height * 4
+      if (decoded.length !== expectedLen) continue
+      const image = {
+        width: icon.width,
+        height: icon.height,
+        data: decoded,
+      }
+      if (map.hasImage(imageName)) {
+        map.updateImage(imageName, image)
+      } else {
+        map.addImage(imageName, image)
+      }
+    } catch (e) {
+      console.warn('[TreeIcons] failed to register enriched icon', {
+        category: icon.category,
+        error: (e as Error)?.message ?? String(e),
+      })
     }
   }
 
   // Fallback icon generation for any missing category icon
   for (const cat of ALL_CATEGORIES) {
     if (map.hasImage(`tree-${cat}`)) continue
-    const canvas = drawTreeIcon(cat, size)
-    const imageData = canvas.getContext('2d')!.getImageData(0, 0, size, size)
-    map.addImage(`tree-${cat}`, {
-      width: size,
-      height: size,
-      data: new Uint8Array(imageData.data.buffer),
-    })
+    try {
+      const canvas = drawTreeIcon(cat, size)
+      const ctx = canvas.getContext('2d')
+      if (!ctx) continue
+      const imageData = ctx.getImageData(0, 0, size, size)
+      map.addImage(`tree-${cat}`, {
+        width: size,
+        height: size,
+        data: new Uint8Array(imageData.data.buffer),
+      })
+    } catch (e) {
+      console.warn('[TreeIcons] failed to register fallback icon', {
+        category: cat,
+        error: (e as Error)?.message ?? String(e),
+      })
+    }
   }
 }
