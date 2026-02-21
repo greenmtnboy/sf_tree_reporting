@@ -42,6 +42,7 @@ const {
   query: duckQuery,
   ensureTileProtocolRegistered,
   setTileQuery,
+  setPublishedTreeIdFilterSql,
   setViewportZoom,
   setViewportCenter,
   setVisibleTileRange,
@@ -51,7 +52,7 @@ const {
 } = useDuckDB()
 const { categoryIcons, loading, error, getSpeciesEnrichment } = useTreeData()
 const { target: flyToTarget } = useFlyTo()
-const { currentMapQuery, mapQueryRevision, publishMapQuery } = useMapData()
+const { currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision, publishMapQuery } = useMapData()
 const displayError = computed(() => error.value ?? mapError.value)
 const isInitialLoading = computed(() => loading.value || defaultQueryLoading.value || introActive.value)
 
@@ -653,6 +654,7 @@ async function loadDefaultMapData() {
   lastVisibleRangeSigByZoom.clear()
   introLockedRangeByZoom.clear()
   setTileQuery(currentMapQuery.value)
+  setPublishedTreeIdFilterSql(publishedTreeIdFilterSql.value)
   addTreeLayers()
 }
 
@@ -1111,7 +1113,7 @@ watch(categoryIcons, (icons) => {
 })
 
 // If data loads after map is ready
-watch([currentMapQuery, mapQueryRevision], ([query]) => {
+watch([currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision], ([query, filterSql]) => {
   if (!map?.loaded()) return
   loadingMessage.value = 'Counting our conifers...'
   mapQueryChangedAt = nowMs()
@@ -1121,6 +1123,7 @@ watch([currentMapQuery, mapQueryRevision], ([query]) => {
   lastVisibleRangeSigByZoom.clear()
   introLockedRangeByZoom.clear()
   setTileQuery(query)
+  setPublishedTreeIdFilterSql(filterSql)
   addTreeLayers()
 })
 
@@ -1155,7 +1158,7 @@ watch(flyToTarget, (t) => {
       zoom: t.zoom ?? 16,
       pitch: 60,
       bearing: targetBearing,
-      duration: 2500,
+      duration: 3200,
       essential: true,
     })
   }, 2200)

@@ -8,6 +8,7 @@ type TileRangeParams = { minX: number; maxX: number; minY: number; maxY: number 
 type WorkerMethodMap = {
   ensureInit: { params: Record<string, never>; result: { ready: boolean; initError: string | null } }
   setTileQuery: { params: { sql: string | null }; result: void }
+  setPublishedTreeIdFilterSql: { params: { sql: string | null }; result: void }
   setViewportZoom: { params: { zoom: number }; result: void }
   setViewportCenter: { params: { lng: number; lat: number }; result: void }
   setVisibleTileRange: { params: { z: number; minX: number; maxX: number; minY: number; maxY: number }; result: void }
@@ -134,6 +135,10 @@ function setTileQuery(sql: string | null) {
   fireAndForget('setTileQuery', { sql })
 }
 
+function setPublishedTreeIdFilterSql(sql: string | null) {
+  fireAndForget('setPublishedTreeIdFilterSql', { sql })
+}
+
 function setViewportZoom(zoom: number) {
   fireAndForget('setViewportZoom', { zoom })
 }
@@ -195,6 +200,7 @@ export function useDuckDB() {
     ensureInit,
     ensureTileProtocolRegistered,
     setTileQuery,
+    setPublishedTreeIdFilterSql,
     setViewportZoom,
     setViewportCenter,
     setVisibleTileRange,

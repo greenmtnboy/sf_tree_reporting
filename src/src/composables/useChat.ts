@@ -41,13 +41,13 @@ const TOOLS = [
   {
     name: 'publish_results',
     description:
-      'Takes a Trilogy/PreQL SELECT query whose results contain at minimum latitude, longitude, and common_name concepts. Compiles and executes the query, then publishes the results as the new map data source, replacing what is currently displayed. Use this after the user asks to see specific trees on the map (e.g., "show me all palm trees"). Always include all relevant concepts so the map popups work correctly.',
+      'Takes a Trilogy/PreQL SELECT query that returns tree_id values for the trees to display on the map. Compiles and executes the query, persists those IDs as the active map filter, and applies DB-side filtering across map tiles. Use this after the user asks to show/highlight a subset of trees. The query only needs tree_id.',
     input_schema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Trilogy/PreQL SELECT returning rows with latitude, longitude, and tree concepts',
+          description: 'Trilogy/PreQL SELECT returning tree_id values (alias optional)',
         },
       },
       required: ['query'],
@@ -98,7 +98,7 @@ const SYSTEM_PROMPT = buildCustomTrilogyPrompt(
 
 You have access to tools for querying the tree dataset, displaying query results on the map, navigating the map camera, and looking up SF landmarks.
 
-When users ask about trees, write Trilogy/PreQL SELECT queries using the available concepts. When they want to visualize results on the map, use publish_results. When they mention locations, use lookup_landmark to find coordinates, then navigate there.
+When users ask about trees, write Trilogy/PreQL SELECT queries using the available concepts. When they want to visualize results on the map, use publish_results with a query that returns tree_id values only. When they mention locations, use lookup_landmark to find coordinates, then navigate there.
 
 AVAILABLE CONCEPTS:
 - tree_id (int) — unique identifier
@@ -120,8 +120,8 @@ COMMON FUNCTIONS: ${functions.join(', ')}
 VALID DATA TYPES: ${datatypes.join(', ')}
 
 IMPORTANT GUIDELINES:
-1. Always use a reasonable LIMIT (e.g., 100–500) unless the user asks for all data
-2. When publishing to the map, always include tree_id, common_name, species, latitude, longitude, diameter_at_breast_height, plant_date, and site_info so popups have full data
+1. Use a reasonable LIMIT (e.g., 100–500) for exploratory run_query calls. For publish_results tree_id filters, do not add restrictive LIMIT unless the user explicitly asks for a capped subset.
+2. For publish_results, return only tree_id (or alias that resolves to tree_id). Do not require latitude/longitude in publish queries.
 3. If a query fails, explain the error and try a corrected version
 
 Be concise and helpful. When showing query results, format them nicely.`,
@@ -136,7 +136,7 @@ export function useChat() {
   const { query: duckQuery } = useDuckDB()
   const { flyTo } = useFlyTo()
   const { landmarks } = useLandmarkData()
-  const { publishMapQuery } = useMapData()
+  const { publishMapTreeIdFilterSql, clearMapTreeIdFilter } = useMapData()
   const trilogy = useTrilogyCore()
 
   // Ensure the Trilogy resolver points at the production service
@@ -229,8 +229,30 @@ export function useChat() {
         case 'publish_results': {
           const { query } = input as { query: string }
           const sql = await compilePreQL(query)
-          publishMapQuery(sql)
-          return { result: 'Published query to the map.', isError: false }
+          const wrappedSql = `
+SELECT tree_id
+FROM (
+${sql}
+) AS __publish_ids
+WHERE tree_id IS NOT NULL
+`
+
+          const { rows } = await duckQuery(`SELECT COUNT(*) AS cnt FROM (${wrappedSql}) AS __count_ids`)
+          const count = Number(rows[0]?.cnt ?? 0)
+
+          if (!Number.isFinite(count) || count <= 0) {
+            clearMapTreeIdFilter()
+            return {
+              result: 'Publish query returned no tree_ids. Cleared the active map filter.',
+              isError: false,
+            }
+          }
+
+          publishMapTreeIdFilterSql(wrappedSql)
+          return {
+            result: `Published ${count} tree_ids to the map filter.`,
+            isError: false,
+          }
         }
         case 'navigate': {
           const { latitude, longitude, zoom, locations } = input as {

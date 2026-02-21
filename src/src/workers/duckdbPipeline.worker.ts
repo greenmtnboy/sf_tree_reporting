@@ -46,6 +46,7 @@ const WEB_MERCATOR_MAX = 20037508.342789244
 const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
 const MAX_TILE_CACHE_ENTRIES = 1536
 const MAX_PARALLEL_TILE_WORK = 2
+const PUBLISHED_TREE_FILTER_TABLE = 'published_tree_filter_ids'
 
 type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }
 type PrefetchStatus = 'executed' | 'deduped' | 'skipped'
@@ -61,11 +62,12 @@ type QueuedTileRequest = {
 
 const tileCache = new Map<string, Uint8Array>()
 const emptyTileKeys = new Set<string>()
+const persistentTileCacheKeys = new Set<string>()
 const inflightTileRequests = new Map<string, Promise<Uint8Array>>()
 const zoomBatchReady = new Set<string>()
 const inflightZoomBatch = new Map<string, Promise<void>>()
 const inflightNeighborhoodBatch = new Map<string, Promise<void>>()
-const preparedFeatureTableRevisionByZoom = new Map<number, number>()
+const preparedFeatureTablesReady = new Set<string>()
 const inflightFeatureTableBuild = new Map<string, Promise<void>>()
 const dataTileBoundsByZoom = new Map<number, TileBounds>()
 const visibleTileRangeByZoom = new Map<number, TileBounds>()
@@ -75,6 +77,8 @@ const pendingTileQueue: QueuedTileRequest[] = []
 
 let tileQuerySql: string | null = null
 let tileQueryRevision = 0
+let publishedTreeIdFilterSql: string | null = null
+let publishedTreeIdFilterSignature = 'all'
 let activeViewportZoom = 13
 let activeViewportCenter: { lng: number; lat: number } | null = null
 let spatialExtensionReady = false
@@ -92,6 +96,36 @@ function sanitizeBaseQuery(sql: string | null): string {
   return sql.trim().replace(/;+\s*$/, '')
 }
 
+function hashText(text: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16)
+}
+
+function treeFilterSignature(): string {
+  return publishedTreeIdFilterSignature
+}
+
+function applyTreeFilterToBaseQuery(baseQuery: string): string {
+  if (!publishedTreeIdFilterSql?.trim()) return baseQuery
+  return `
+WITH __base AS (
+  ${baseQuery}
+)
+SELECT __base.*
+FROM __base
+INNER JOIN ${PUBLISHED_TREE_FILTER_TABLE} __filter_ids
+  ON CAST(__base.tree_id AS BIGINT) = __filter_ids.tree_id
+`
+}
+
+function effectiveBaseQuery(sql: string | null): string {
+  return applyTreeFilterToBaseQuery(sanitizeBaseQuery(sql))
+}
+
 function normalizeSql(sql: string): string {
   return sql.replace(/\s+/g, ' ').trim().toLowerCase()
 }
@@ -101,32 +135,57 @@ function isDefaultBaseQuery(sql: string): boolean {
 }
 
 function tileCacheKey(z: number, x: number, y: number): string {
-  return `${tileQueryRevision}:${z}/${x}/${y}`
+  return `${tileQueryRevision}:${treeFilterSignature()}:${z}/${x}/${y}`
 }
 
 function tileCacheKeyForRevision(rev: number, z: number, x: number, y: number): string {
-  return `${rev}:${z}/${x}/${y}`
+  return `${rev}:${treeFilterSignature()}:${z}/${x}/${y}`
+}
+
+function parseTileCacheKey(key: string): { rev: number; filterSig: string; z: number; x: number; y: number } | null {
+  const firstSep = key.indexOf(':')
+  const secondSep = key.indexOf(':', firstSep + 1)
+  if (firstSep < 0 || secondSep < 0) return null
+  const revPart = key.slice(0, firstSep)
+  const filterSig = key.slice(firstSep + 1, secondSep)
+  const zxy = key.slice(secondSep + 1)
+  const [zPart, xPart, yPart] = zxy.split('/')
+  const rev = Number(revPart)
+  const z = Number(zPart)
+  const x = Number(xPart)
+  const y = Number(yPart)
+  if (![rev, z, x, y].every((v) => Number.isFinite(v))) return null
+  return { rev, filterSig, z, x, y }
 }
 
 function zoomFromTileCacheKey(key: string): number | null {
-  const sep = key.indexOf(':')
-  if (sep < 0) return null
-  const slash = key.indexOf('/', sep + 1)
-  if (slash < 0) return null
-  const z = Number(key.slice(sep + 1, slash))
-  return Number.isFinite(z) ? z : null
+  return parseTileCacheKey(key)?.z ?? null
+}
+
+function shouldPersistLowZoomSfTile(key: string): boolean {
+  const parsed = parseTileCacheKey(key)
+  if (!parsed) return false
+  if (parsed.rev !== tileQueryRevision) return false
+  if (parsed.filterSig !== treeFilterSignature()) return false
+  if (parsed.z > 14) return false
+  const bounds = getDataTileBounds(parsed.z)
+  if (!bounds) return false
+  return parsed.x >= bounds.minX
+    && parsed.x <= bounds.maxX
+    && parsed.y >= bounds.minY
+    && parsed.y <= bounds.maxY
 }
 
 function zoomBatchKey(rev: number, z: number): string {
-  return `${rev}:${z}`
+  return `${rev}:${treeFilterSignature()}:${z}`
 }
 
 function neighborhoodBatchKey(rev: number, z: number, minX: number, maxX: number, minY: number, maxY: number): string {
-  return `${rev}:${z}:${minX}-${maxX}:${minY}-${maxY}`
+  return `${rev}:${treeFilterSignature()}:${z}:${minX}-${maxX}:${minY}-${maxY}`
 }
 
 function featureTableBuildKey(rev: number, z: number): string {
-  return `${rev}:${z}`
+  return `${rev}:${treeFilterSignature()}:${z}`
 }
 
 function featureTableName(z: number): string {
@@ -300,15 +359,36 @@ function setCachedTile(key: string, tile: Uint8Array): void {
 
     emptyTileKeys.add(key)
     if (tileCache.has(key)) tileCache.delete(key)
+    persistentTileCacheKeys.delete(key)
     return
   }
 
   emptyTileKeys.delete(key)
+  if (shouldPersistLowZoomSfTile(key)) persistentTileCacheKeys.add(key)
+  else persistentTileCacheKeys.delete(key)
+
   if (tileCache.has(key)) tileCache.delete(key)
   tileCache.set(key, tile)
   if (tileCache.size > MAX_TILE_CACHE_ENTRIES) {
-    const firstKey = tileCache.keys().next().value as string | undefined
-    if (firstKey) tileCache.delete(firstKey)
+    let evictionKey: string | undefined
+    for (const candidate of tileCache.keys()) {
+      if (!persistentTileCacheKeys.has(candidate)) {
+        evictionKey = candidate
+        break
+      }
+    }
+
+    // Safety fallback: still enforce global cap even if all retained tiles are
+    // currently marked persistent.
+    if (!evictionKey) {
+      evictionKey = tileCache.keys().next().value as string | undefined
+    }
+
+    if (evictionKey) {
+      tileCache.delete(evictionKey)
+      emptyTileKeys.delete(evictionKey)
+      persistentTileCacheKeys.delete(evictionKey)
+    }
   }
 }
 
@@ -578,9 +658,9 @@ async function ensurePreparedFeatureTableForZoom(z: number, baseQuery: string): 
   if (!conn || z !== 15) return
 
   const rev = tileQueryRevision
-  if (preparedFeatureTableRevisionByZoom.get(z) === rev) return
-
   const key = featureTableBuildKey(rev, z)
+  if (preparedFeatureTablesReady.has(key)) return
+
   const inflight = inflightFeatureTableBuild.get(key)
   if (inflight) {
     await inflight
@@ -629,7 +709,9 @@ WHERE xtile >= 0
   AND NOT ST_IsEmpty(feature.geom)
 `
     await conn.query(sql)
-    if (rev === tileQueryRevision) preparedFeatureTableRevisionByZoom.set(z, rev)
+    if (rev === tileQueryRevision && key === featureTableBuildKey(tileQueryRevision, z)) {
+      preparedFeatureTablesReady.add(key)
+    }
   })()
 
   inflightFeatureTableBuild.set(key, request)
@@ -980,7 +1062,7 @@ async function generatePointTileMvt(z: number, x: number, y: number): Promise<Ui
   const inflight = inflightTileRequests.get(key)
   if (inflight) return inflight
 
-  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  const baseQuery = effectiveBaseQuery(tileQuerySql)
   const { simplifyGridMeters } = adaptiveLodForTile(z, x, y)
   const bounds = tileBounds3857(z, x, y)
   const batchKey = zoomBatchKey(tileQueryRevision, z)
@@ -1100,13 +1182,59 @@ function setTileQuery(sql: string | null) {
   tileQueryRevision += 1
   tileCache.clear()
   emptyTileKeys.clear()
+  persistentTileCacheKeys.clear()
   inflightTileRequests.clear()
   zoomBatchReady.clear()
   inflightZoomBatch.clear()
   inflightNeighborhoodBatch.clear()
-  preparedFeatureTableRevisionByZoom.clear()
+  preparedFeatureTablesReady.clear()
   inflightFeatureTableBuild.clear()
   visibleTileRangeByZoom.clear()
+  prefetchedVisibleRangeSigByZoom.clear()
+  prewarmDoneRevision = -1
+  prewarmPromise = null
+}
+
+async function setPublishedTreeIdFilterSql(sql: string | null) {
+  await ensureInit()
+  if (!conn) return
+  const normalized = sql?.trim() || null
+
+  await conn.query(`DROP TABLE IF EXISTS ${PUBLISHED_TREE_FILTER_TABLE}`)
+
+  if (normalized) {
+    await conn.query(`
+CREATE TEMP TABLE ${PUBLISHED_TREE_FILTER_TABLE} AS
+SELECT DISTINCT CAST(tree_id AS BIGINT) AS tree_id
+FROM (
+  ${normalized}
+) __published_ids
+WHERE tree_id IS NOT NULL
+`)
+
+    const countResult = await conn.query(`SELECT COUNT(*) AS cnt FROM ${PUBLISHED_TREE_FILTER_TABLE}`)
+    const count = Number(countResult.get(0)?.cnt ?? 0)
+
+    if (Number.isFinite(count) && count > 0) {
+      publishedTreeIdFilterSql = normalized
+      publishedTreeIdFilterSignature = `sql-${hashText(normalizeSql(normalized))}`
+    } else {
+      await conn.query(`DROP TABLE IF EXISTS ${PUBLISHED_TREE_FILTER_TABLE}`)
+      publishedTreeIdFilterSql = null
+      publishedTreeIdFilterSignature = 'all'
+    }
+  } else {
+    publishedTreeIdFilterSql = null
+    publishedTreeIdFilterSignature = 'all'
+  }
+
+  // Preserve tile cache across filter toggles; keys include filter signature.
+  inflightTileRequests.clear()
+  zoomBatchReady.clear()
+  inflightZoomBatch.clear()
+  inflightNeighborhoodBatch.clear()
+  preparedFeatureTablesReady.clear()
+  inflightFeatureTableBuild.clear()
   prefetchedVisibleRangeSigByZoom.clear()
   prewarmDoneRevision = -1
   prewarmPromise = null
@@ -1143,10 +1271,10 @@ async function prefetchVisibleDetailTilesAtZoom(z: number, rangeOverride?: TileB
   const range = getVisibleTileRange(z)
   if (!range) return 'skipped'
 
-  const sig = `${tileQueryRevision}:${z}:${range.minX}-${range.maxX}:${range.minY}-${range.maxY}`
+  const sig = `${tileQueryRevision}:${treeFilterSignature()}:${z}:${range.minX}-${range.maxX}:${range.minY}-${range.maxY}`
   if (prefetchedVisibleRangeSigByZoom.get(z) === sig) return 'deduped'
 
-  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  const baseQuery = effectiveBaseQuery(tileQuerySql)
   if (z === 15) {
     await ensurePreparedFeatureTableForZoom(15, baseQuery)
   }
@@ -1169,7 +1297,7 @@ async function prewarmLodCaches(): Promise<void> {
     return
   }
 
-  const baseQuery = sanitizeBaseQuery(tileQuerySql)
+  const baseQuery = effectiveBaseQuery(tileQuerySql)
   prewarmPromise = (async () => {
     const viewport = activeViewportCenter
     const focusZoom = Math.max(15, Math.min(19, Math.round(activeViewportZoom)))
@@ -1249,6 +1377,7 @@ async function getTile(z: number, x: number, y: number): Promise<Uint8Array> {
 type WorkerMethodMap = {
   ensureInit: { params: Record<string, never>; result: { ready: boolean; initError: string | null } }
   setTileQuery: { params: { sql: string | null }; result: void }
+  setPublishedTreeIdFilterSql: { params: { sql: string | null }; result: void }
   setViewportZoom: { params: { zoom: number }; result: void }
   setViewportCenter: { params: { lng: number; lat: number }; result: void }
   setVisibleTileRange: { params: { z: number; minX: number; maxX: number; minY: number; maxY: number }; result: void }
@@ -1306,6 +1435,12 @@ ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       case 'setTileQuery': {
         const { sql } = msg.params as WorkerMethodMap['setTileQuery']['params']
         setTileQuery(sql)
+        send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
+        break
+      }
+      case 'setPublishedTreeIdFilterSql': {
+        const { sql } = msg.params as WorkerMethodMap['setPublishedTreeIdFilterSql']['params']
+        await setPublishedTreeIdFilterSql(sql)
         send({ type: 'response', requestId: msg.requestId, ok: true, result: undefined })
         break
       }
