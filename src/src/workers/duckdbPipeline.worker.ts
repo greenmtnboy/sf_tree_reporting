@@ -45,7 +45,7 @@ WHERE latitude IS NOT NULL AND longitude IS NOT NULL
 const WEB_MERCATOR_MAX = 20037508.342789244
 const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
 const MAX_TILE_CACHE_ENTRIES = 1536
-const MAX_PARALLEL_TILE_WORK = 2
+const MAX_PARALLEL_TILE_WORK = 3
 const PUBLISHED_TREE_FILTER_TABLE = 'published_tree_filter_ids'
 
 type TileBounds = { minX: number; maxX: number; minY: number; maxY: number }

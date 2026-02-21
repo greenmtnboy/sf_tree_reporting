@@ -86,7 +86,7 @@ property species.canopy_spread_ft float;
 property species.growth_rate string;            # slow | moderate | fast
 property species.lifespan_years string;         # e.g. "50-100", "200+"
 property species.drought_tolerance string;      # low | moderate | high
-property species.bloom_season string;
+property species.bloom_season string;           # September to November | autumn and winter | late spring and summer | late spring or summer | late spring to autumn | spring | spring and summer | summer | winter | year-round
 property species.wildlife_value string;         # low | moderate | high
 property species.fire_risk string;              # low | moderate | high
 property species.tree_category string;          # palm | broadleaf | spreading | coniferous | columnar | ornamental | default
@@ -119,8 +119,8 @@ root datasource raw_tree_enrichment (
 grain (species)
 file `./tree_enrichment.py`;
 
-# Cached datasource: reads the persisted parquet written as a side-effect
-# by the script above. Use this for day-to-day queries to avoid re-running.
+# Cached datasource: reads/writes the persisted parquet in GCS.
+# Use this for day-to-day queries to avoid re-running enrichment.
 datasource tree_enrichment (
     species,
     common_names,
@@ -141,5 +141,5 @@ datasource tree_enrichment (
     enriched_at,
 )
 grain (species)
-file `./tree_enrichment.parquet`
+file `https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_enrichment.parquet`:`gcs://trilogy_public_models/duckdb/sf_trees/tree_enrichment.parquet`
 freshness by enriched_at;

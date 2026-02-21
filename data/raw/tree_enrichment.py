@@ -8,18 +8,17 @@ import sys
 import math
 import base64
 import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow.compute as pc
 import requests
 import duckdb
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Literal, Optional
 from PIL import Image, ImageDraw, ImageFilter
 from pydantic import BaseModel, Field
 import instructor
 
 ICON_SIZE = 48
-ENRICHMENT_PARQUET = Path(__file__).parent / "tree_enrichment.parquet"
+ENRICHMENT_PARQUET = "https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_enrichment.parquet"
 TREE_INFO_PARQUET = "https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_info.parquet"
 
 
@@ -238,8 +237,32 @@ SYNONYMS = {
     "yucca spp": "Yucca",
     "zelkova serrata 'village green'": "Zelkova serrata",
     "patanus racemosa": "Platanus racemosa",
-    "x chiranthofremontia lenzii": "× Chiranthofremontia"
+    "x chiranthofremontia lenzii": "× Chiranthofremontia",
+    "brahea brandegeei": "Brahea",
+    "caryota maxima 'himalaya'": "Caryota maxima",
+    "citrus × limon 'lisbon'": "Lemon",
+    "citrus × meyeri 'improved'": "Meyer lemon",
+    "cornus nuttallii x florida 'eddie's white wonder'": "Cornus × elwinmoorei",
+    "dypsis cabadae": "Dypsis",
+    "eucalyptus simmondsi": "Eucalyptus simmondsii",
+    "ficus carica 'black mission'": "Common fig",
+    "ficus carica 'brown turkey'": "Common fig",
+    "fraxinus holotricha": "Fraxinus",
+    "fraxinus x moraine": "Fraxinus americana",
+    "leptospermum scoparium 'helene strybing'": "Leptospermum scoparium",
+    "magnolia x foggii 'jack fogg'": "Magnolia × foggii",
+    "pyracantha 'santa cruz'": "Pyracantha",
+    "robinia x ambigua 'idahoensis'": "Robinia × ambigua",
+    "robinia x ambigua 'purple robe'": "Robinia × ambigua",
+    "robinia x ambigua": "Robinia × ambigua",
+    "x chiranthofremontia lenzii": "× Chiranthofremontia",
 }
+
+EXCLUDED_SPECIES = {"::", "tree", "to be determine'd"}
+
+
+def should_skip_species(species: str) -> bool:
+    return species.strip().lower() in EXCLUDED_SPECIES
 
 # ── Pydantic model ─────────────────────────────────────────────────────────────
 
@@ -485,19 +508,33 @@ def get_all_species() -> list[str]:
     conn = duckdb.connect()
     try:
         rows = conn.execute(
-            "SELECT DISTINCT species FROM read_parquet(?) WHERE plant_type= 'Tree' AND species IS NOT NULL ORDER BY species",
+            """
+            SELECT DISTINCT species
+            FROM read_parquet(?)
+            WHERE plant_type = 'Tree'
+              AND species IS NOT NULL
+              AND lower(trim(species)) NOT IN ('::', 'tree', 'to be determine''d')
+            ORDER BY species
+            """,
             [TREE_INFO_PARQUET],
         ).fetchall()
-        return [row[0] for row in rows]
+        return [row[0] for row in rows if not should_skip_species(row[0])]
     finally:
         conn.close()
 
 
 def get_already_enriched() -> set[str]:
-    if not ENRICHMENT_PARQUET.exists():
+    conn = duckdb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT species FROM read_parquet(?) WHERE species IS NOT NULL",
+            [ENRICHMENT_PARQUET],
+        ).fetchall()
+        return {row[0] for row in rows}
+    except Exception:
         return set()
-    tbl = pq.read_table(ENRICHMENT_PARQUET, columns=["species"])
-    return set(tbl.column("species").to_pylist())
+    finally:
+        conn.close()
 
 
 # ── Arrow table ────────────────────────────────────────────────────────────────
@@ -581,13 +618,56 @@ if __name__ == "__main__":
             "enriched_at":      datetime.now(tz=timezone.utc),
         })
 
-    # Merge with existing enrichment data and persist as side-effect parquet
-    # (the parquet serves as the incrementality store on the next daily run)
-    if already_enriched and ENRICHMENT_PARQUET.exists():
-        existing = pq.read_table(ENRICHMENT_PARQUET)
-        merged = pa.concat_tables([existing, build_table(new_rows)])
+    # Merge with existing remote enrichment data and emit full merged output.
+    # Trilogy persists the datasource output to configured storage.
+    if already_enriched:
+        conn = duckdb.connect()
+        try:
+            existing = conn.execute(
+                """
+                SELECT
+                  species,
+                  common_names,
+                  native_status,
+                  is_evergreen,
+                  mature_height_ft,
+                  canopy_spread_ft,
+                  growth_rate,
+                  lifespan_years,
+                  drought_tolerance,
+                  bloom_season,
+                  wildlife_value,
+                  fire_risk,
+                  tree_category,
+                  icon_rgba_b64,
+                  icon_width,
+                  icon_height,
+                  enriched_at
+                FROM read_parquet(?)
+                """,
+                [ENRICHMENT_PARQUET],
+            ).fetch_arrow_table()
+        except Exception:
+            existing = None
+        finally:
+            conn.close()
+
+        if existing is not None:
+            # Minimal fix: normalize only enriched_at timezone metadata.
+            tz_idx = existing.schema.get_field_index("enriched_at")
+            if tz_idx >= 0:
+                target_ts = SCHEMA.field("enriched_at").type
+                current_ts = existing.schema.field(tz_idx).type
+                if current_ts != target_ts:
+                    existing = existing.set_column(
+                        tz_idx,
+                        "enriched_at",
+                        pc.cast(existing.column(tz_idx), target_ts, safe=False),
+                    )
+            merged = pa.concat_tables([existing, build_table(new_rows)])
+        else:
+            merged = build_table(new_rows)
     else:
         merged = build_table(new_rows)
 
-    pq.write_table(merged, ENRICHMENT_PARQUET)
     emit(merged)

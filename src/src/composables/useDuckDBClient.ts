@@ -131,12 +131,14 @@ async function ensureInit() {
   await initPromise
 }
 
-function setTileQuery(sql: string | null) {
-  fireAndForget('setTileQuery', { sql })
+async function setTileQuery(sql: string | null): Promise<void> {
+  await ensureInit()
+  await rpc('setTileQuery', { sql })
 }
 
-function setPublishedTreeIdFilterSql(sql: string | null) {
-  fireAndForget('setPublishedTreeIdFilterSql', { sql })
+async function setPublishedTreeIdFilterSql(sql: string | null): Promise<void> {
+  await ensureInit()
+  await rpc('setPublishedTreeIdFilterSql', { sql })
 }
 
 function setViewportZoom(zoom: number) {

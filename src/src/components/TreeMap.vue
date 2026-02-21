@@ -653,8 +653,8 @@ async function loadDefaultMapData() {
   defaultQueryLoading.value = true
   lastVisibleRangeSigByZoom.clear()
   introLockedRangeByZoom.clear()
-  setTileQuery(currentMapQuery.value)
-  setPublishedTreeIdFilterSql(publishedTreeIdFilterSql.value)
+  await setTileQuery(currentMapQuery.value)
+  await setPublishedTreeIdFilterSql(publishedTreeIdFilterSql.value)
   addTreeLayers()
 }
 
@@ -1113,7 +1113,7 @@ watch(categoryIcons, (icons) => {
 })
 
 // If data loads after map is ready
-watch([currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision], ([query, filterSql]) => {
+watch([currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision], async ([query, filterSql]) => {
   if (!map?.loaded()) return
   loadingMessage.value = 'Counting our conifers...'
   mapQueryChangedAt = nowMs()
@@ -1122,8 +1122,8 @@ watch([currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision], ([query, fi
   defaultQueryLoading.value = true
   lastVisibleRangeSigByZoom.clear()
   introLockedRangeByZoom.clear()
-  setTileQuery(query)
-  setPublishedTreeIdFilterSql(filterSql)
+  await setTileQuery(query)
+  await setPublishedTreeIdFilterSql(filterSql)
   addTreeLayers()
 })
 

@@ -1,5 +1,4 @@
 import raw.tree_info;
 
 
-select count_distinct(split(split(species, '::')[1], ' ')[1]) as genus_count
-;
+SELECT tree_id WHERE is_evergreen = true limit 10;

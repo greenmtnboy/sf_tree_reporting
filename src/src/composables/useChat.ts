@@ -110,6 +110,20 @@ AVAILABLE CONCEPTS:
 - longitude (float) — geographic longitude
 - diameter_at_breast_height (float) — trunk diameter in inches
 
+SPECIES-LEVEL ENRICHMENT CONCEPTS:
+- common_names (string) — comma-separated common names for the species
+- native_status (string) — native_bay_area | native_california | non_native | naturalized | unknown
+- is_evergreen (bool)
+- mature_height_ft (float)
+- canopy_spread_ft (float)
+- growth_rate (string) — slow | moderate | fast
+- lifespan_years (string) — e.g. "50-100", "200+"
+- drought_tolerance (string) — low | moderate | high
+- bloom_season (string) — September to November | autumn and winter | late spring and summer | late spring or summer | late spring to autumn | spring | spring and summer | summer | winter | year-round
+- wildlife_value (string) — low | moderate | high
+- fire_risk (string) — low | moderate | high
+- tree_category (string) — palm | broadleaf | spreading | coniferous | columnar | ornamental | default
+
 TRILOGY SYNTAX RULES:
 ${rulesInput}
 
