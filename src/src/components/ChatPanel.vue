@@ -1,19 +1,12 @@
 <template>
-  <!-- Toggle button -->
-  <button v-if="!isOpen" class="chat-toggle-btn" @click="isOpen = true">Chat</button>
-
-  <!-- Mobile overlay backdrop -->
-  <div v-if="isOpen && isMobile" class="chat-overlay" @click="isOpen = false"></div>
-
   <!-- Chat panel -->
-  <aside v-if="isOpen" :class="['chat-panel', { 'chat-panel--mobile': isMobile }]">
+  <aside class="chat-panel">
     <div class="chat-header">
       <span>Tree Assistant</span>
       <div class="chat-header-actions">
         <button v-if="hasApiKey && messages.length" class="chat-clear-btn" @click="clearMessages" title="Clear chat">
           Clear
         </button>
-        <button class="chat-close-btn" @click="isOpen = false">&times;</button>
       </div>
     </div>
 
@@ -63,24 +56,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, nextTick, watch } from 'vue'
 import { useChat } from '../composables/useChat'
 
 const { messages, isLoading, hasApiKey, setApiKey, sendMessage, clearMessages } = useChat()
 
-const isOpen = ref(false)
 const userInput = ref('')
 const keyInput = ref('')
 const messagesContainer = ref<HTMLDivElement>()
-const windowWidth = ref(window.innerWidth)
-
-const isMobile = computed(() => windowWidth.value < 768)
-
-function onResize() {
-  windowWidth.value = window.innerWidth
-}
-onMounted(() => window.addEventListener('resize', onResize))
-onUnmounted(() => window.removeEventListener('resize', onResize))
 
 function saveKey() {
   if (keyInput.value.trim()) {
@@ -123,25 +106,6 @@ watch(
 </script>
 
 <style scoped>
-.chat-toggle-btn {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 20;
-  background: #0f3460;
-  color: #4fc3f7;
-  border: 1px solid #4fc3f7;
-  border-radius: 24px;
-  padding: 10px 20px;
-  cursor: pointer;
-  font-size: 0.875rem;
-  font-weight: 500;
-  transition: background 0.15s;
-}
-.chat-toggle-btn:hover {
-  background: #16213e;
-}
-
 .chat-panel {
   width: 360px;
   min-width: 360px;
@@ -151,27 +115,6 @@ watch(
   display: flex;
   flex-direction: column;
   z-index: 15;
-}
-
-.chat-panel--mobile {
-  position: fixed;
-  bottom: 0;
-  right: 0;
-  left: 0;
-  width: 100%;
-  min-width: unset;
-  height: 70vh;
-  border-left: none;
-  border-top: 1px solid #0f3460;
-  border-radius: 12px 12px 0 0;
-  z-index: 25;
-}
-
-.chat-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  z-index: 24;
 }
 
 .chat-header {
@@ -200,18 +143,6 @@ watch(
   padding: 2px 6px;
 }
 .chat-clear-btn:hover {
-  color: #e0e0e0;
-}
-
-.chat-close-btn {
-  background: none;
-  border: none;
-  color: #7a7a9e;
-  font-size: 1.25rem;
-  cursor: pointer;
-  line-height: 1;
-}
-.chat-close-btn:hover {
   color: #e0e0e0;
 }
 

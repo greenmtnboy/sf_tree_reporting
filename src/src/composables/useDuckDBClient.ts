@@ -3,6 +3,7 @@ import maplibregl from 'maplibre-gl'
 import DuckDBPipelineWorker from '../workers/duckdbPipeline.worker?worker'
 
 type PrefetchStatus = 'executed' | 'deduped' | 'skipped'
+type TileRangeParams = { minX: number; maxX: number; minY: number; maxY: number }
 
 type WorkerMethodMap = {
   ensureInit: { params: Record<string, never>; result: { ready: boolean; initError: string | null } }
@@ -10,7 +11,7 @@ type WorkerMethodMap = {
   setViewportZoom: { params: { zoom: number }; result: void }
   setViewportCenter: { params: { lng: number; lat: number }; result: void }
   setVisibleTileRange: { params: { z: number; minX: number; maxX: number; minY: number; maxY: number }; result: void }
-  prefetchVisibleDetailTilesAtZoom: { params: { z: number }; result: PrefetchStatus }
+  prefetchVisibleDetailTilesAtZoom: { params: { z: number; range?: TileRangeParams }; result: PrefetchStatus }
   prewarmLodCaches: { params: Record<string, never>; result: void }
   setAutoTileFetchEnabled: { params: { enabled: boolean }; result: void }
   query: { params: { sql: string }; result: { columns: string[]; rows: Record<string, unknown>[] } }
@@ -145,9 +146,9 @@ function setVisibleTileRange(z: number, minX: number, maxX: number, minY: number
   fireAndForget('setVisibleTileRange', { z, minX, maxX, minY, maxY })
 }
 
-async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<PrefetchStatus> {
+async function prefetchVisibleDetailTilesAtZoom(z: number, range?: TileRangeParams): Promise<PrefetchStatus> {
   await ensureInit()
-  return rpc('prefetchVisibleDetailTilesAtZoom', { z })
+  return rpc('prefetchVisibleDetailTilesAtZoom', { z, range })
 }
 
 async function prewarmLodCaches(): Promise<void> {

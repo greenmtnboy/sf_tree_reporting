@@ -1,7 +1,6 @@
 <template>
   <div ref="mapContainer" class="tree-map"></div>
-  <div class="zoom-indicator">Zoom: {{ zoomLevel.toFixed(2) }}</div>
-  <div v-if="isInitialLoading" class="map-loading">Loading tree data...</div>
+  <div v-if="isInitialLoading" class="map-loading">{{ loadingMessage }}</div>
   <div v-if="displayError" class="map-error">{{ displayError }}</div>
 </template>
 
@@ -20,6 +19,7 @@ const zoomLevel = ref(13)
 const mapError = ref<string | null>(null)
 const defaultQueryLoading = ref(true)
 const introActive = ref(true)
+const loadingMessage = ref('Counting our conifers...')
 let map: maplibregl.Map | null = null
 let mapInitStartedAt = 0
 let mapQueryChangedAt = 0
@@ -33,6 +33,8 @@ let introRafId: number | null = null
 let introCancelled = false
 let activeTreePopup: maplibregl.Popup | null = null
 let popupRequestToken = 0
+let treesSourceReloadNonce = 0
+let zoomControlLabelEl: HTMLDivElement | null = null
 const lastVisibleRangeSigByZoom = new Map<number, string>()
 const introLockedRangeByZoom = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>()
 
@@ -53,6 +55,8 @@ const { currentMapQuery, mapQueryRevision, publishMapQuery } = useMapData()
 const displayError = computed(() => error.value ?? mapError.value)
 const isInitialLoading = computed(() => loading.value || defaultQueryLoading.value || introActive.value)
 
+const MAX_ZOOM = 19
+
 const INTRO_CENTER: [number, number] = [-122.4194, 37.7749]
 const INTRO_START_ZOOM = 18.5
 const INTRO_END_ZOOM = 13.5
@@ -60,12 +64,15 @@ const INTRO_DURATION_MS = 10_000
 const INTRO_ROTATION_DEG = 240
 const INITIAL_TILE_PREFETCH_SCALE = 3.5
 const TREES_SOURCE_MAXZOOM = 16
-const SCROLL_WHEEL_ZOOM_RATE = 1 / 1800
+const SCROLL_WHEEL_ZOOM_RATE = 1 / 5800
 const SCROLL_ZOOM_RATE = 1 / 400
 const CENTER_ICON_GRID_RADIUS_PX = 96
 const CENTER_ICON_GRID_SIZE = 3
 const CENTER_ICON_GRID_MIN_POPULATED_CELLS = 5
 const CENTER_ICON_GRID_MIN_TOTAL_ICONS = 8
+const VIEWPORT_TREE_MIN_FEATURES = 1
+const VIEWPORT_TREE_STABLE_FRAMES = 2
+const TREE_CATEGORIES: TreeCategory[] = ['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default']
 
 // Centralized zoom pivot points for layer transitions/sizing.
 const HEATMAP_ZOOM_INTENSITY_START = 10
@@ -172,20 +179,20 @@ async function waitForTreesMilestone(timeoutMs = 2500): Promise<void> {
   })
 }
 
-async function waitForInitialDetailedTrees(timeoutMs = 5000): Promise<void> {
-  if (!map) return
+async function waitForInitialDetailedTrees(timeoutMs = 5000): Promise<boolean> {
+  if (!map) return false
   const startedAt = nowMs()
 
-  await new Promise<void>((resolve) => {
-    if (!map) return resolve()
+  return await new Promise<boolean>((resolve) => {
+    if (!map) return resolve(false)
 
     const tick = () => {
-      if (!map) return resolve()
+      if (!map) return resolve(false)
 
       const iconCount = map.queryRenderedFeatures(undefined, { layers: ['trees-icon'] }).length
-      if (iconCount > 0) return resolve()
+      if (iconCount > 0) return resolve(true)
 
-      if (nowMs() - startedAt >= timeoutMs) return resolve()
+      if (nowMs() - startedAt >= timeoutMs) return resolve(false)
       requestAnimationFrame(tick)
     }
 
@@ -193,18 +200,17 @@ async function waitForInitialDetailedTrees(timeoutMs = 5000): Promise<void> {
   })
 }
 
-async function waitForCenteredDetailedTrees(timeoutMs = 5000): Promise<void> {
-  if (!map) return
+async function waitForCenteredDetailedTrees(targetCenter: [number, number], timeoutMs = 5000): Promise<boolean> {
+  if (!map) return false
   const startedAt = nowMs()
 
-  await new Promise<void>((resolve) => {
-    if (!map) return resolve()
+  return await new Promise<boolean>((resolve) => {
+    if (!map) return resolve(false)
 
     const tick = () => {
-      if (!map) return resolve()
+      if (!map) return resolve(false)
 
-      const center = map.getCenter()
-      const centerPx = map.project(center)
+      const centerPx = map.project(targetCenter)
       const gridSize = Math.max(1, CENTER_ICON_GRID_SIZE)
       const radiusPx = CENTER_ICON_GRID_RADIUS_PX
       const minX = centerPx.x - radiusPx
@@ -241,13 +247,87 @@ async function waitForCenteredDetailedTrees(timeoutMs = 5000): Promise<void> {
       const centerReady = centerCellIcons > 0
       const gridReady = populatedCells >= CENTER_ICON_GRID_MIN_POPULATED_CELLS
       const densityReady = totalIcons >= CENTER_ICON_GRID_MIN_TOTAL_ICONS
-      if (centerReady && gridReady && densityReady) return resolve()
-      if (nowMs() - startedAt >= timeoutMs) return resolve()
+      if (centerReady && gridReady && densityReady) return resolve(true)
+      if (nowMs() - startedAt >= timeoutMs) return resolve(false)
       requestAnimationFrame(tick)
     }
 
     tick()
   })
+}
+
+async function waitForViewportTreesRendered(timeoutMs = 6000): Promise<boolean> {
+  if (!map) return false
+  const startedAt = nowMs()
+
+  return await new Promise<boolean>((resolve) => {
+    if (!map) return resolve(false)
+    let stableFrames = 0
+
+    const tick = () => {
+      if (!map) return resolve(false)
+
+      const canvas = map.getCanvas()
+      const width = Math.max(1, canvas.clientWidth)
+      const height = Math.max(1, canvas.clientHeight)
+      const features = map.queryRenderedFeatures(
+        [
+          [0, 0],
+          [width, height],
+        ],
+        { layers: ['trees-icon', 'trees-circle'] },
+      )
+      const viewportTreeCount = features.length
+
+      const sourceReady = map.isSourceLoaded('trees')
+      const frameReady = sourceReady && viewportTreeCount >= VIEWPORT_TREE_MIN_FEATURES
+
+      if (frameReady) {
+        stableFrames += 1
+        if (stableFrames >= VIEWPORT_TREE_STABLE_FRAMES) return resolve(true)
+      } else {
+        stableFrames = 0
+      }
+
+      if (nowMs() - startedAt >= timeoutMs) return resolve(false)
+      requestAnimationFrame(tick)
+    }
+
+    tick()
+  })
+}
+
+function computeVisibleTileRangeForZoom(z: number): { minX: number; maxX: number; minY: number; maxY: number } | null {
+  if (!map) return null
+  const bounds = map.getBounds()
+  const clampLat = (lat: number) => Math.max(-85.05112878, Math.min(85.05112878, lat))
+  const n = Math.pow(2, z)
+  const lonToTileX = (lon: number) => Math.floor(((lon + 180) / 360) * n)
+  const latToTileY = (lat: number) => {
+    const latRad = (clampLat(lat) * Math.PI) / 180
+    return Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n)
+  }
+
+  const minX = Math.max(0, Math.min(n - 1, lonToTileX(bounds.getWest())))
+  const maxX = Math.max(0, Math.min(n - 1, lonToTileX(bounds.getEast())))
+  const minY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getNorth())))
+  const maxY = Math.max(0, Math.min(n - 1, latToTileY(bounds.getSouth())))
+  return { minX, maxX, minY, maxY }
+}
+
+function requestTreesSourceReload() {
+  if (!map) return
+  const source = map.getSource('trees') as any
+  if (source && typeof source.reload === 'function') {
+    source.reload()
+  }
+  map.triggerRepaint()
+}
+
+function forceTreesTileRefetchPass() {
+  treesSourceReloadNonce += 1
+  addTreeLayers()
+  map?.triggerRepaint()
 }
 
 function runIntroZoomSegment(
@@ -258,11 +338,14 @@ function runIntroZoomSegment(
   durationMs: number,
   startBearing: number,
   pitch: number,
+  center: [number, number],
+  rotationDeg: number,
+  onProgress?: (globalT: number) => void,
 ): Promise<void> {
   return new Promise((resolve) => {
     if (!map) return resolve()
-    const baseLng = INTRO_CENTER[0]
-    const baseLat = INTRO_CENTER[1]
+    const baseLng = center[0]
+    const baseLat = center[1]
     const segmentStart = nowMs()
 
     const step = () => {
@@ -274,9 +357,10 @@ function runIntroZoomSegment(
       const local = Math.max(0, Math.min(1, (nowMs() - segmentStart) / durationMs))
       const easedLocal = local * local * (3 - 2 * local)
       const globalT = fromT + (toT - fromT) * easedLocal
+      onProgress?.(globalT)
 
       const zoom = fromZoom + (toZoom - fromZoom) * easedLocal
-      const bearing = startBearing + INTRO_ROTATION_DEG * globalT
+      const bearing = startBearing + rotationDeg * globalT
       const angle = globalT * Math.PI * 2
       // Start/end at exact center to avoid a visible hop.
       const radiusDeg = 0.0012 * Math.sin(globalT * Math.PI)
@@ -313,13 +397,19 @@ async function runIntroZoomOut() {
 
   const startBearing = map.getBearing()
   const startPitch = map.getPitch()
+  const introCenter: [number, number] = [INTRO_CENTER[0], INTRO_CENTER[1]]
+  const introStartZoom = INTRO_START_ZOOM
+  const introEndZoom = INTRO_END_ZOOM
+  const introRotationDeg = INTRO_ROTATION_DEG
+  const introDurationMs = INTRO_DURATION_MS
+  let didRunIntroMotion = false
 
   try {
     // Re-anchor to the exact intro start pose first, then wait for centered
     // detailed icons before beginning motion.
     map.jumpTo({
-      center: INTRO_CENTER,
-      zoom: INTRO_START_ZOOM,
+      center: introCenter,
+      zoom: introStartZoom,
       bearing: startBearing,
       pitch: startPitch,
     })
@@ -329,41 +419,70 @@ async function runIntroZoomOut() {
 
     // Hard gate intro movement until detailed tiles are actually rendered at
     // the starting viewpoint.
-    const startZoomRounded = Math.round(INTRO_START_ZOOM)
-    const prefetchZooms = Array.from(new Set([startZoomRounded, Math.max(15, startZoomRounded - 1)]))
+    const sourceStartZoom = Math.min(TREES_SOURCE_MAXZOOM, Math.round(introStartZoom))
+    const prefetchZooms = Array.from(new Set([sourceStartZoom, Math.max(15, sourceStartZoom - 1)]))
     for (const z of prefetchZooms) {
       if (z < 15) continue
-      const status = await prefetchVisibleDetailTilesAtZoom(z)
+      const range = computeVisibleTileRangeForZoom(z)
+      if (range) {
+        introLockedRangeByZoom.set(z, range)
+        setVisibleTileRange(z, range.minX, range.maxX, range.minY, range.maxY)
+      }
+      const status = await prefetchVisibleDetailTilesAtZoom(z, range ?? undefined)
       recordIntroPrefetchStatus(z, status)
     }
 
-    await waitForTreesMilestone(2500)
-    await waitForInitialDetailedTrees(5000)
-    await waitForCenteredDetailedTrees(5000)
+    // During intro auto-fetch is disabled; force a source reload pass so
+    // MapLibre re-requests viewport tiles and consumes freshly prefetched
+    // cached data instead of stale empty responses.
+    requestTreesSourceReload()
+    forceTreesTileRefetchPass()
 
-    if (!introCancelled) {
+    await waitForTreesMilestone(2500)
+    const initialReady = await waitForInitialDetailedTrees(5000)
+    const centeredReady = await waitForCenteredDetailedTrees(introCenter, 5000)
+    const viewportReady = await waitForViewportTreesRendered(6000)
+
+    const canStartMotion = initialReady || centeredReady || viewportReady
+
+    if (!introCancelled && canStartMotion) {
+      loadingMessage.value = 'Tracking seed dispersion...'
+      let didSetFinalPhase = false
       await runIntroZoomSegment(
-        INTRO_START_ZOOM,
-        INTRO_END_ZOOM,
+        introStartZoom,
+        introEndZoom,
         0,
         1,
-        INTRO_DURATION_MS,
+        introDurationMs,
         startBearing,
         startPitch,
+        introCenter,
+        introRotationDeg,
+        (globalT) => {
+          if (!didSetFinalPhase && globalT >= 0.72) {
+            didSetFinalPhase = true
+            loadingMessage.value = 'Reticulating splines...'
+          }
+        },
       )
+      didRunIntroMotion = true
+    } else if (!introCancelled) {
+      console.warn('[Perf] map:intro-gate:blocked-motion', {
+        canStartMotion,
+        initialReady,
+        centeredReady,
+        viewportReady,
+      })
     }
   } finally {
     setAutoTileFetchEnabled(true)
-    if (map) {
+    if (map && didRunIntroMotion) {
       map.jumpTo({
-        center: INTRO_CENTER,
-        zoom: INTRO_END_ZOOM,
-        bearing: startBearing + INTRO_ROTATION_DEG,
+        center: introCenter,
+        zoom: introEndZoom,
+        bearing: startBearing + introRotationDeg,
         pitch: startPitch,
       })
-
-      // Force a fresh tile request pass now that automatic fetch is re-enabled.
-      addTreeLayers()
     }
     introActive.value = false
     introLockedRangeByZoom.clear()
@@ -438,13 +557,25 @@ function buildColorExpression(): maplibregl.ExpressionSpecification {
 }
 
 function buildIconExpression(): maplibregl.ExpressionSpecification {
-  const categories: TreeCategory[] = ['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default']
   const expr: any[] = ['match', ['get', 'category']]
-  for (const cat of categories) {
+  for (const cat of TREE_CATEGORIES) {
     expr.push(cat, `tree-${cat}`)
   }
   expr.push('tree-default') // fallback
   return expr as maplibregl.ExpressionSpecification
+}
+
+function buildHeatmapColorExpression(category: TreeCategory): maplibregl.ExpressionSpecification {
+  const color = CATEGORY_COLORS[category] ?? '#66BB6A'
+  return [
+    'interpolate',
+    ['linear'],
+    ['heatmap-density'],
+    0, 'rgba(0,0,0,0)',
+    0.2, 'rgba(0,0,0,0)',
+    0.55, color,
+    1, color,
+  ] as maplibregl.ExpressionSpecification
 }
 
 function buildSqrtDbhExpression(minValue: number, maxValue: number): maplibregl.ExpressionSpecification {
@@ -514,6 +645,7 @@ async function loadDefaultMapData() {
     return
   }
 
+  loadingMessage.value = 'Counting our conifers...'
   mapQueryChangedAt = nowMs()
   firstTreesSourceLoadedLogged = false
   firstMapIdleAfterPublishLogged = false
@@ -564,18 +696,20 @@ async function showTreePopup(feature: GeoJSON.Feature, offset: number) {
 
 function addTreeLayers() {
   if (!map) return
+  const mapInstance = map
   const t0 = nowMs()
   console.info('[Perf] map:layers:add:start')
-  const treeTiles = [`duckdb://trees/{z}/{x}/{y}.pbf?r=${mapQueryRevision.value}`]
+  const treeTiles = [`duckdb://trees/{z}/{x}/{y}.pbf?r=${mapQueryRevision.value}&n=${treesSourceReloadNonce}`]
+  const heatLayerIds = TREE_CATEGORIES.map((category) => `trees-heat-${category}`)
 
-  const existingSource = map.getSource('trees') as any
-  const hasHeatLayer = !!map.getLayer('trees-heat')
-  const hasCircleLayer = !!map.getLayer('trees-circle')
-  const hasIconLayer = !!map.getLayer('trees-icon')
+  const existingSource = mapInstance.getSource('trees') as any
+  const hasHeatLayers = heatLayerIds.every((id) => !!mapInstance.getLayer(id))
+  const hasCircleLayer = !!mapInstance.getLayer('trees-circle')
+  const hasIconLayer = !!mapInstance.getLayer('trees-icon')
 
   // Prefer in-place source URL refresh to avoid tearing down layers, which can
   // cause visible pop during LOD transitions and query revision updates.
-  if (existingSource && hasHeatLayer && hasCircleLayer && hasIconLayer) {
+  if (existingSource && hasHeatLayers && hasCircleLayer && hasIconLayer) {
     if (typeof existingSource.setTiles === 'function') {
       existingSource.setTiles(treeTiles)
       if (typeof existingSource.reload === 'function') {
@@ -589,12 +723,14 @@ function addTreeLayers() {
     }
   }
 
-  if (map.getLayer('trees-icon')) map.removeLayer('trees-icon')
-  if (map.getLayer('trees-circle')) map.removeLayer('trees-circle')
-  if (map.getLayer('trees-heat')) map.removeLayer('trees-heat')
-  if (map.getSource('trees')) map.removeSource('trees')
+  if (mapInstance.getLayer('trees-icon')) mapInstance.removeLayer('trees-icon')
+  if (mapInstance.getLayer('trees-circle')) mapInstance.removeLayer('trees-circle')
+  for (const id of heatLayerIds) {
+    if (mapInstance.getLayer(id)) mapInstance.removeLayer(id)
+  }
+  if (mapInstance.getSource('trees')) mapInstance.removeSource('trees')
 
-  map.addSource('trees', {
+  mapInstance.addSource('trees', {
     type: 'vector',
     tiles: treeTiles,
     minzoom: 0,
@@ -603,63 +739,56 @@ function addTreeLayers() {
     maxzoom: TREES_SOURCE_MAXZOOM,
   })
 
-  // Layer 1: Heatmap at far zoom
-  map.addLayer({
-    id: 'trees-heat',
-    type: 'heatmap',
-    source: 'trees',
-    'source-layer': 'trees',
-    maxzoom: HEATMAP_ZOOM_OPACITY_END,
-    paint: {
-      // Normalize count by grid area so heatmap color is consistent across
-      // different aggregation tiers. Reference grid is 32m.
-      'heatmap-weight': [
-        'interpolate',
-        ['linear'],
-        [
-          '*',
-          ['coalesce', ['to-number', ['get', 'point_count']], 1],
-          ['^', ['/', 32, ['coalesce', ['to-number', ['get', 'grid_m']], 32]], 2],
+  // Layer 1: Category heatmaps at far zoom.
+  for (const category of TREE_CATEGORIES) {
+    mapInstance.addLayer({
+      id: `trees-heat-${category}`,
+      type: 'heatmap',
+      source: 'trees',
+      'source-layer': 'trees',
+      maxzoom: HEATMAP_ZOOM_OPACITY_END,
+      filter: ['==', ['coalesce', ['get', 'category'], 'default'], category],
+      paint: {
+        // Normalize count by grid area so heatmap color is consistent across
+        // different aggregation tiers. Reference grid is 32m.
+        'heatmap-weight': [
+          'interpolate',
+          ['linear'],
+          [
+            '*',
+            ['coalesce', ['to-number', ['get', 'point_count']], 1],
+            ['^', ['/', 32, ['coalesce', ['to-number', ['get', 'grid_m']], 32]], 2],
+          ],
+          1, 0.2,
+          8, 0.45,
+          32, 0.75,
+          128, 1.05,
         ],
-        1, 0.2,
-        8, 0.45,
-        32, 0.75,
-        128, 1.05,
-      ],
-      'heatmap-intensity': [
-        'interpolate', ['linear'], ['zoom'],
-        HEATMAP_ZOOM_INTENSITY_START, 0.85,
-        HEATMAP_ZOOM_INTENSITY_MID, 1.2,
-        HEATMAP_ZOOM_INTENSITY_END, 1.9,
-      ],
-      'heatmap-radius': [
-        'interpolate', ['linear'], ['zoom'],
-        HEATMAP_ZOOM_RADIUS_START, 10,
-        HEATMAP_ZOOM_RADIUS_MID, 14,
-        HEATMAP_ZOOM_RADIUS_END, 22,
-      ],
-      'heatmap-color': [
-        'interpolate',
-        ['linear'],
-        ['heatmap-density'],
-        0, 'rgba(0,0,0,0)',
-        0.15, '#1a237e',
-        0.35, '#0f3460',
-        0.55, '#2E7D32',
-        0.75, '#4CAF50',
-        1, '#8BC34A',
-      ],
-      'heatmap-opacity': [
-        'interpolate', ['linear'], ['zoom'],
-        HEATMAP_ZOOM_OPACITY_START, 1.0,
-        HEATMAP_ZOOM_OPACITY_MID, 0.62,
-        HEATMAP_ZOOM_OPACITY_END, 0,
-      ],
-    },
-  })
+        'heatmap-intensity': [
+          'interpolate', ['linear'], ['zoom'],
+          HEATMAP_ZOOM_INTENSITY_START, 0.85,
+          HEATMAP_ZOOM_INTENSITY_MID, 1.2,
+          HEATMAP_ZOOM_INTENSITY_END, 1.9,
+        ],
+        'heatmap-radius': [
+          'interpolate', ['linear'], ['zoom'],
+          HEATMAP_ZOOM_RADIUS_START, 10,
+          HEATMAP_ZOOM_RADIUS_MID, 14,
+          HEATMAP_ZOOM_RADIUS_END, 22,
+        ],
+        'heatmap-color': buildHeatmapColorExpression(category),
+        'heatmap-opacity': [
+          'interpolate', ['linear'], ['zoom'],
+          HEATMAP_ZOOM_OPACITY_START, 0.48,
+          HEATMAP_ZOOM_OPACITY_MID, 0.33,
+          HEATMAP_ZOOM_OPACITY_END, 0,
+        ],
+      },
+    })
+  }
 
   // Layer 2: Colored circles at medium zoom
-  map.addLayer({
+  mapInstance.addLayer({
     id: 'trees-circle',
     type: 'circle',
     source: 'trees',
@@ -674,6 +803,7 @@ function addTreeLayers() {
       'circle-opacity': [
         'interpolate', ['linear'], ['zoom'],
         CIRCLE_ZOOM_OPACITY_START, 0,
+        CIRCLE_ZOOM_OPACITY_START+.1, 0.75,
         CIRCLE_ZOOM_OPACITY_MID, 0.92,
         CIRCLE_ZOOM_OPACITY_END - .1, .75,
         CIRCLE_ZOOM_OPACITY_END, 0,
@@ -686,7 +816,7 @@ function addTreeLayers() {
   })
 
   // Layer 3: Tree icons at close zoom
-  map.addLayer({
+  mapInstance.addLayer({
     id: 'trees-icon',
     type: 'symbol',
     source: 'trees',
@@ -737,9 +867,37 @@ function addTreeLayers() {
   console.info('[Perf] map:layers:add:done', { ms: Math.round(nowMs() - t0) })
 }
 
+function ensureZoomControlLabel() {
+  if (!map) return
+  if (zoomControlLabelEl?.isConnected) return
+
+  const container = map.getContainer()
+  const zoomIn = container.querySelector('.maplibregl-ctrl-zoom-in') as HTMLButtonElement | null
+  const zoomOut = container.querySelector('.maplibregl-ctrl-zoom-out') as HTMLButtonElement | null
+  if (!zoomIn || !zoomOut) return
+
+  const ctrlGroup = zoomIn.parentElement
+  if (!ctrlGroup) return
+
+  let label = ctrlGroup.querySelector('.maplibregl-ctrl-zoom-level') as HTMLDivElement | null
+  if (!label) {
+    label = document.createElement('div')
+    label.className = 'maplibregl-ctrl-icon maplibregl-ctrl-zoom-level'
+    label.setAttribute('aria-hidden', 'true')
+    zoomIn.insertAdjacentElement('afterend', label)
+  }
+
+  zoomControlLabelEl = label
+  zoomControlLabelEl.textContent = zoomLevel.value.toFixed(2)
+}
+
 function updateZoomLevel() {
   if (!map) return
   zoomLevel.value = map.getZoom()
+  ensureZoomControlLabel()
+  if (zoomControlLabelEl) {
+    zoomControlLabelEl.textContent = zoomLevel.value.toFixed(2)
+  }
   setViewportZoom(zoomLevel.value)
   const c = map.getCenter()
   setViewportCenter(c.lng, c.lat)
@@ -788,13 +946,14 @@ function updateZoomLevel() {
   }
 
   const z = Math.round(map.getZoom())
-  if (z >= 13 && z <= 20) {
-    const candidateZooms = new Set<number>([z])
-    if (introActive.value && z >= 15) {
+  const sourceZ = Math.min(TREES_SOURCE_MAXZOOM, z)
+  if (sourceZ >= 13 && sourceZ <= 20) {
+    const candidateZooms = new Set<number>([sourceZ])
+    if (introActive.value && sourceZ >= 15) {
       // Intro path is a zoom-out, so prefetch current + next-coarser detailed
       // LOD only. Avoid warming finer zooms (z+1) which adds extra queries
       // (e.g. z20) without improving visible continuity.
-      candidateZooms.add(Math.max(15, z - 1))
+      candidateZooms.add(Math.max(15, sourceZ - 1))
     }
 
     for (const targetZoom of candidateZooms) {
@@ -806,7 +965,7 @@ function updateZoomLevel() {
         setVisibleTileRange(targetZoom, minX, maxX, minY, maxY)
 
         if (introActive.value && targetZoom >= 15) {
-          void prefetchVisibleDetailTilesAtZoom(targetZoom)
+          void prefetchVisibleDetailTilesAtZoom(targetZoom, { minX, maxX, minY, maxY })
             .then((status) => {
               recordIntroPrefetchStatus(targetZoom, status)
             })
@@ -816,7 +975,7 @@ function updateZoomLevel() {
         }
       }
 
-      if (targetZoom === z && isInitialLoading.value) {
+      if (targetZoom === sourceZ && isInitialLoading.value) {
         const tilesVisible = Math.max(1, (maxX - minX + 1) * (maxY - minY + 1))
         logIconLayerDebug('initial-visible-tiles', {
           z: targetZoom,
@@ -845,7 +1004,7 @@ onMounted(() => {
     pitch: 60,
     bearing: -20,
     maxPitch: 70,
-    maxZoom: INTRO_START_ZOOM,
+    maxZoom: MAX_ZOOM,
     keyboard: true,
   })
 
@@ -860,6 +1019,7 @@ onMounted(() => {
   }
 
   map.addControl(new maplibregl.NavigationControl(), 'top-right')
+  ensureZoomControlLabel()
   map.on('zoom', updateZoomLevel)
   map.on('move', updateZoomLevel)
 
@@ -938,6 +1098,7 @@ watch(categoryIcons, (icons) => {
 // If data loads after map is ready
 watch([currentMapQuery, mapQueryRevision], ([query]) => {
   if (!map?.loaded()) return
+  loadingMessage.value = 'Counting our conifers...'
   mapQueryChangedAt = nowMs()
   firstTreesSourceLoadedLogged = false
   firstMapIdleAfterPublishLogged = false
@@ -992,6 +1153,7 @@ onUnmounted(() => {
     activeTreePopup.remove()
     activeTreePopup = null
   }
+  zoomControlLabelEl = null
   map?.remove()
   map = null
 })
@@ -1003,19 +1165,20 @@ onUnmounted(() => {
   height: 100%;
 }
 
-.zoom-indicator {
-  position: absolute;
-  top: 58px;
-  right: 12px;
-  z-index: 5;
-  background: rgba(22, 33, 62, 0.9);
+:deep(.maplibregl-ctrl-group .maplibregl-ctrl-zoom-level) {
+  display: grid;
+  place-items: center;
+  width: 29px;
+  min-height: 29px;
   color: #4fc3f7;
-  border: 1px solid #0f3460;
-  border-radius: 6px;
-  padding: 6px 10px;
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  background: #1a1a2e;
+  border-top: 1px solid rgba(79, 195, 247, 0.24);
+  border-bottom: 1px solid rgba(79, 195, 247, 0.24);
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
 }
 
 .map-loading,
@@ -1031,7 +1194,7 @@ onUnmounted(() => {
 }
 
 .map-loading {
-  background: rgba(22, 33, 62, 0.9);
+  background: rgba(22, 33, 62, 0.96);
   color: #4fc3f7;
 }
 

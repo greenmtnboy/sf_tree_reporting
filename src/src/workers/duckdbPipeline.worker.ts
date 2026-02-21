@@ -1113,9 +1113,13 @@ function setVisibleTileRange(z: number, minX: number, maxX: number, minY: number
   })
 }
 
-async function prefetchVisibleDetailTilesAtZoom(z: number): Promise<PrefetchStatus> {
+async function prefetchVisibleDetailTilesAtZoom(z: number, rangeOverride?: TileBounds): Promise<PrefetchStatus> {
   await ensureInit()
   if (!conn || !spatialExtensionReady || z < 15) return 'skipped'
+
+  if (rangeOverride) {
+    setVisibleTileRange(z, rangeOverride.minX, rangeOverride.maxX, rangeOverride.minY, rangeOverride.maxY)
+  }
 
   const range = getVisibleTileRange(z)
   if (!range) return 'skipped'
@@ -1229,7 +1233,10 @@ type WorkerMethodMap = {
   setViewportZoom: { params: { zoom: number }; result: void }
   setViewportCenter: { params: { lng: number; lat: number }; result: void }
   setVisibleTileRange: { params: { z: number; minX: number; maxX: number; minY: number; maxY: number }; result: void }
-  prefetchVisibleDetailTilesAtZoom: { params: { z: number }; result: PrefetchStatus }
+  prefetchVisibleDetailTilesAtZoom: {
+    params: { z: number; range?: { minX: number; maxX: number; minY: number; maxY: number } }
+    result: PrefetchStatus
+  }
   prewarmLodCaches: { params: Record<string, never>; result: void }
   setAutoTileFetchEnabled: { params: { enabled: boolean }; result: void }
   query: { params: { sql: string }; result: { columns: string[]; rows: Record<string, unknown>[] } }
@@ -1302,8 +1309,8 @@ ctx.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         break
       }
       case 'prefetchVisibleDetailTilesAtZoom': {
-        const { z } = msg.params as WorkerMethodMap['prefetchVisibleDetailTilesAtZoom']['params']
-        const status = await prefetchVisibleDetailTilesAtZoom(z)
+        const { z, range } = msg.params as WorkerMethodMap['prefetchVisibleDetailTilesAtZoom']['params']
+        const status = await prefetchVisibleDetailTilesAtZoom(z, range)
         send({ type: 'response', requestId: msg.requestId, ok: true, result: status })
         break
       }
