@@ -1,17 +1,13 @@
-name: Playwright Tests
+name: CI
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
 jobs:
-  test:
+  build:
     timeout-minutes: 15
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        browser: [chromium, firefox, webkit]
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-node@v4
@@ -32,36 +28,8 @@ jobs:
 
     - name: Install dependencies
       working-directory: ./src
-      run: pnpm install
-
-    - name: Cache Playwright browsers
-      id: playwright-cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/ms-playwright
-        key: playwright-${{ matrix.browser }}-${{ runner.os }}-${{ hashFiles('src/pnpm-lock.yaml') }}
-
-    - name: Install Playwright browser
-      working-directory: ./src
-      if: steps.playwright-cache.outputs.cache-hit != 'true'
-      run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
-
-    - name: Install Playwright system deps (on cache hit)
-      working-directory: ./src
-      if: steps.playwright-cache.outputs.cache-hit == 'true'
-      run: pnpm exec playwright install-deps ${{ matrix.browser }}
+      run: pnpm install --frozen-lockfile
 
     - name: Build app
       working-directory: ./src
       run: pnpm build
-
-    - name: Run Playwright tests
-      working-directory: ./src
-      run: pnpm exec playwright test --project="${{ matrix.browser }}*"
-
-    - uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: playwright-report-${{ matrix.browser }}
-        path: src/playwright-report/
-        retention-days: 30

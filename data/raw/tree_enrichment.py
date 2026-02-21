@@ -55,7 +55,7 @@ SYNONYMS = {
     "brugmansia spp": "Brugmansia",
     "callistemon 'jeffers'": "Callistemon",
     "carpinus betulus 'fastigiata'": "Carpinus betulus",
-    "caryota maxima 'himalaya'": "Caryota maxima",
+    "caryota maxima 'himalaya'": "Caryota",
     "casurina stricta": "Allocasuarina verticillata",
     "ceanothus 'ray hartman'": "Ceanothus",
     "ceanothus sps": "Ceanothus",
@@ -242,7 +242,7 @@ SYNONYMS = {
     "caryota maxima 'himalaya'": "Caryota maxima",
     "citrus × limon 'lisbon'": "Lemon",
     "citrus × meyeri 'improved'": "Meyer lemon",
-    "cornus nuttallii x florida 'eddie's white wonder'": "Cornus × elwinmoorei",
+    "cornus nuttallii x florida 'eddie's white wonder'": "Cornus nuttallii",
     "dypsis cabadae": "Dypsis",
     "eucalyptus simmondsi": "Eucalyptus simmondsii",
     "ficus carica 'black mission'": "Common fig",
@@ -252,8 +252,8 @@ SYNONYMS = {
     "leptospermum scoparium 'helene strybing'": "Leptospermum scoparium",
     "magnolia x foggii 'jack fogg'": "Magnolia × foggii",
     "pyracantha 'santa cruz'": "Pyracantha",
-    "robinia x ambigua 'idahoensis'": "Robinia × ambigua",
-    "robinia x ambigua 'purple robe'": "Robinia × ambigua",
+    "robinia x ambigua 'idahoensis'": "Robinia",
+    "robinia x ambigua 'purple robe'": "Robinia",
     "robinia x ambigua": "Robinia × ambigua",
     "x chiranthofremontia lenzii": "× Chiranthofremontia",
 }
@@ -422,7 +422,7 @@ def to_raw_rgba_b64(img: Image.Image) -> str:
     return base64.b64encode(img.tobytes()).decode()
 
 
-# ── Wikipedia ──────────────────────────────────────────────────────────────────
+# ── External data sources ───────────────────────────────────────────────────────
 
 HEADERS = {"User-Agent": "sf-tree-enrichment/1.0 (github.com/sf-tree-reporting)"}
 
@@ -467,6 +467,100 @@ def fetch_wikipedia_text(scientific_name: str) -> str | None:
     return None
 
 
+def fetch_powo_text(scientific_name: str) -> str | None:
+    """Fetch descriptive text from Plants of the World Online (POWO / Kew).
+
+    POWO curates the World Checklist of Vascular Plants and provides
+    habitat, morphology, and distribution descriptions.
+    """
+    try:
+        r = requests.get(
+            "https://powo.science.kew.org/api/2/search",
+            params={"q": scientific_name, "f": "species_f"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", [])
+        if not results:
+            return None
+        fq_id = results[0].get("fqId")
+        if not fq_id:
+            return None
+
+        r2 = requests.get(
+            f"https://powo.science.kew.org/api/2/taxon/{fq_id}",
+            params={"fields": "descriptions,distribution"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        if r2.status_code != 200:
+            return None
+        data = r2.json()
+
+        parts = []
+        for desc_block in data.get("descriptions", []):
+            for item in desc_block.get("descriptions", []):
+                char = item.get("characteristic", "")
+                text = item.get("description", "")
+                if text:
+                    parts.append(f"{char}: {text}" if char else text)
+
+        # Include native distribution regions
+        dist = data.get("distribution", {})
+        natives = [
+            r.get("name")
+            for r in dist.get("natives", [])
+            if r.get("name")
+        ]
+        if natives:
+            parts.append(f"Native distribution: {', '.join(natives)}")
+
+        return "\n".join(parts) if parts else None
+    except Exception:
+        return None
+
+
+def fetch_wfo_text(scientific_name: str) -> str | None:
+    """Fetch taxonomic context from World Flora Online (WFO).
+
+    WFO provides stable WFO-IDs, accepted names, and family/order
+    classification useful for resolving synonyms and taxonomy.
+    """
+    try:
+        r = requests.get(
+            "https://list.worldfloraonline.org/api.php",
+            params={"terms": scientific_name, "fuzzy": "false", "full": "true"},
+            headers=HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        docs = data.get("docs", [])
+        if not docs:
+            return None
+        doc = docs[0]
+
+        parts = []
+        accepted = doc.get("acceptedNameScientificName") or doc.get("scientificName")
+        if accepted:
+            parts.append(f"Accepted scientific name: {accepted}")
+        if doc.get("family"):
+            parts.append(f"Family: {doc['family']}")
+        if doc.get("order"):
+            parts.append(f"Order: {doc['order']}")
+        if doc.get("taxonRemarks"):
+            parts.append(f"Notes: {doc['taxonRemarks']}")
+        if doc.get("nativeDistribution"):
+            parts.append(f"Native distribution: {doc['nativeDistribution']}")
+
+        return "\n".join(parts) if parts else None
+    except Exception:
+        return None
+
+
 # ── Enrichment ─────────────────────────────────────────────────────────────────
 
 def enrich_species(q_species: str, client) -> TreeEnrichment | None:
@@ -474,13 +568,34 @@ def enrich_species(q_species: str, client) -> TreeEnrichment | None:
     if not scientific_name:
         return None
     wiki_name = SYNONYMS.get(scientific_name.lower(), scientific_name)
-    text = fetch_wikipedia_text(wiki_name)
-    if not text:
+
+    # Gather text from all available sources
+    wiki_text  = fetch_wikipedia_text(wiki_name)
+    powo_text  = fetch_powo_text(scientific_name)
+    wfo_text   = fetch_wfo_text(scientific_name)
+
+    if not wiki_text and not powo_text and not wfo_text:
         print(
-            f"  [skip] no Wikipedia content for {scientific_name!r} (lookup: {wiki_name!r})",
+            f"  [skip] no content found for {scientific_name!r} (lookup: {wiki_name!r})",
             file=sys.stderr,
         )
         return None
+
+    sources_used = ", ".join(
+        label for label, text in [("Wikipedia", wiki_text), ("POWO", powo_text), ("WFO", wfo_text)]
+        if text
+    )
+    print(f"    [sources] {sources_used}", file=sys.stderr)
+
+    context_parts = []
+    if wiki_text:
+        context_parts.append(f"Wikipedia:\n{wiki_text}")
+    if powo_text:
+        context_parts.append(f"Plants of the World Online (POWO / Kew):\n{powo_text}")
+    if wfo_text:
+        context_parts.append(f"World Flora Online (WFO):\n{wfo_text}")
+    combined_text = "\n\n".join(context_parts)
+
     try:
         return client.chat.completions.create(
             response_model=TreeEnrichment,
@@ -488,11 +603,11 @@ def enrich_species(q_species: str, client) -> TreeEnrichment | None:
                 "role": "user",
                 "content": (
                     "You are enriching tree data for an urban forestry dataset in San Francisco, CA.\n"
-                    "Extract structured information about this tree species from the Wikipedia text below.\n"
-                    "Be conservative with numeric estimates — use None if the article doesn't clearly state a value.\n\n"
+                    "Extract structured information about this tree species from the reference text below.\n"
+                    "Be conservative with numeric estimates — use None if the sources don't clearly state a value.\n\n"
                     f"Species: {scientific_name}\n\n"
                     f"Wikipedia lookup: {wiki_name}\n\n"
-                    f"Wikipedia text:\n{text}"
+                    f"Reference text:\n{combined_text}"
                 ),
             }],
         )
@@ -523,18 +638,59 @@ def get_all_species() -> list[str]:
         conn.close()
 
 
-def get_already_enriched() -> set[str]:
+def get_already_enriched() -> tuple[set[str], set[str]]:
+    """Return (all_enriched, complete_enriched).
+
+    'complete' means every core Optional field has a non-null extracted value.
+    Completeness is computed from existing column values so it works even before
+    the is_complete column was added to the parquet.
+    """
     conn = duckdb.connect()
     try:
         rows = conn.execute(
-            "SELECT DISTINCT species FROM read_parquet(?) WHERE species IS NOT NULL",
+            """
+            SELECT
+              species,
+              (common_names IS NOT NULL AND trim(common_names) != ''
+               AND native_status IS NOT NULL
+               AND is_evergreen IS NOT NULL
+               AND mature_height_ft IS NOT NULL
+               AND canopy_spread_ft IS NOT NULL
+               AND growth_rate IS NOT NULL
+               AND lifespan_years IS NOT NULL
+               AND drought_tolerance IS NOT NULL
+               AND bloom_season IS NOT NULL
+               AND wildlife_value IS NOT NULL
+               AND fire_risk IS NOT NULL
+               AND tree_category IS NOT NULL) AS is_complete
+            FROM read_parquet(?)
+            WHERE species IS NOT NULL
+            """,
             [ENRICHMENT_PARQUET],
         ).fetchall()
-        return {row[0] for row in rows}
+        all_enriched      = {row[0] for row in rows}
+        complete_enriched = {row[0] for row in rows if row[1]}
+        return all_enriched, complete_enriched
     except Exception:
-        return set()
+        return set(), set()
     finally:
         conn.close()
+
+
+def compute_is_complete(enrichment: TreeEnrichment) -> bool:
+    """True only when every core field has a non-null extracted value."""
+    return all([
+        bool(enrichment.common_names),
+        enrichment.is_evergreen      is not None,
+        enrichment.mature_height_ft  is not None,
+        enrichment.canopy_spread_ft  is not None,
+        enrichment.growth_rate       is not None,
+        enrichment.lifespan_years    is not None,
+        enrichment.drought_tolerance is not None,
+        enrichment.bloom_season      is not None,
+        enrichment.wildlife_value    is not None,
+        enrichment.fire_risk         is not None,
+    ])
 
 
 # ── Arrow table ────────────────────────────────────────────────────────────────
@@ -553,6 +709,7 @@ SCHEMA = pa.schema([
     ("wildlife_value",   pa.string()),
     ("fire_risk",        pa.string()),
     ("tree_category",    pa.string()),
+    ("is_complete",      pa.bool_()),        # all core Optional fields are non-null
     ("icon_rgba_b64",    pa.string()),
     ("icon_width",       pa.int32()),
     ("icon_height",      pa.int32()),
@@ -574,30 +731,36 @@ def emit(table: pa.Table) -> None:
 if __name__ == "__main__":
     client = instructor.from_provider(
         "google/gemini-2.5-pro",
-        vertexai=True,            
-        project="preqldata", 
+        vertexai=True,
+        project="preqldata",
         location="us-central1"      # e.g., us-central1, europe-west1
     )
 
-    already_enriched = get_already_enriched()
+    already_enriched, complete_enriched = get_already_enriched()
     all_species = get_all_species()
-    to_process = [s for s in all_species if s not in already_enriched]
+    # Process species that are new OR previously enriched but incomplete
+    to_process = [s for s in all_species if s not in complete_enriched]
+    incomplete_count = sum(1 for s in to_process if s in already_enriched)
 
     print(
         f"[info] {len(all_species)} total species | "
-        f"{len(already_enriched)} already enriched | "
+        f"{len(already_enriched)} already enriched "
+        f"({len(complete_enriched)} complete, {incomplete_count} incomplete) | "
         f"{len(to_process)} to process",
         file=sys.stderr,
     )
 
     new_rows: list[dict] = []
     for q_species in to_process:
-        print(f"  [process] {q_species}", file=sys.stderr)
+        status = "re-enrich" if q_species in already_enriched else "new"
+        print(f"  [{status}] {q_species}", file=sys.stderr)
         enrichment = enrich_species(q_species, client)
         if enrichment is None:
             continue
-        
+
         icon = draw_tree_icon(enrichment.tree_category)
+        is_complete = compute_is_complete(enrichment)
+        print(f"    [complete={is_complete}]", file=sys.stderr)
         new_rows.append({
             "species":          q_species,
             "common_names":     ", ".join(enrichment.common_names),
@@ -612,6 +775,7 @@ if __name__ == "__main__":
             "wildlife_value":   enrichment.wildlife_value,
             "fire_risk":        enrichment.fire_risk,
             "tree_category":    enrichment.tree_category,
+            "is_complete":      is_complete,
             "icon_rgba_b64":    to_raw_rgba_b64(icon),
             "icon_width":       ICON_SIZE,
             "icon_height":      ICON_SIZE,
@@ -620,6 +784,9 @@ if __name__ == "__main__":
 
     # Merge with existing remote enrichment data and emit full merged output.
     # Trilogy persists the datasource output to configured storage.
+    # Species we just processed replace their old rows (handles re-enrichment).
+    re_processed = {row["species"] for row in new_rows}
+
     if already_enriched:
         conn = duckdb.connect()
         try:
@@ -639,6 +806,18 @@ if __name__ == "__main__":
                   wildlife_value,
                   fire_risk,
                   tree_category,
+                  (common_names IS NOT NULL AND trim(common_names) != ''
+                   AND native_status IS NOT NULL
+                   AND is_evergreen IS NOT NULL
+                   AND mature_height_ft IS NOT NULL
+                   AND canopy_spread_ft IS NOT NULL
+                   AND growth_rate IS NOT NULL
+                   AND lifespan_years IS NOT NULL
+                   AND drought_tolerance IS NOT NULL
+                   AND bloom_season IS NOT NULL
+                   AND wildlife_value IS NOT NULL
+                   AND fire_risk IS NOT NULL
+                   AND tree_category IS NOT NULL) AS is_complete,
                   icon_rgba_b64,
                   icon_width,
                   icon_height,
@@ -653,7 +832,14 @@ if __name__ == "__main__":
             conn.close()
 
         if existing is not None:
-            # Minimal fix: normalize only enriched_at timezone metadata.
+            # Drop rows for species we just re-processed so new results replace them
+            if re_processed:
+                keep_mask = pc.invert(
+                    pc.is_in(existing.column("species"), pa.array(sorted(re_processed)))
+                )
+                existing = existing.filter(keep_mask)
+
+            # Normalize enriched_at timezone metadata if needed
             tz_idx = existing.schema.get_field_index("enriched_at")
             if tz_idx >= 0:
                 target_ts = SCHEMA.field("enriched_at").type
@@ -664,6 +850,7 @@ if __name__ == "__main__":
                         "enriched_at",
                         pc.cast(existing.column(tz_idx), target_ts, safe=False),
                     )
+
             merged = pa.concat_tables([existing, build_table(new_rows)])
         else:
             merged = build_table(new_rows)

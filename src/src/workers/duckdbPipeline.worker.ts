@@ -42,6 +42,11 @@ FROM trees
 WHERE latitude IS NOT NULL AND longitude IS NOT NULL
 `
 
+const REMOTE_PARQUET_BASE_URL = 'https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees'
+const REMOTE_TREES_PARQUET_URL = `${REMOTE_PARQUET_BASE_URL}/tree_info.parquet`
+const REMOTE_SPECIES_PARQUET_URL = `${REMOTE_PARQUET_BASE_URL}/tree_enrichment.parquet`
+const REMOTE_TREES_FAST_PARQUET_URL = `${REMOTE_PARQUET_BASE_URL}/trees_fast.parquet`
+
 const WEB_MERCATOR_MAX = 20037508.342789244
 const WEB_MERCATOR_WORLD = WEB_MERCATOR_MAX * 2
 const MAX_TILE_CACHE_ENTRIES = 1536
@@ -418,85 +423,30 @@ async function doInit() {
   await conn.query(TABLE_DDL)
   await conn.query(SPECIES_DDL)
 
-  let loadedTreesFromParquet = false
-  try {
-    const resParquet = await fetch(import.meta.env.BASE_URL + 'data/cache/trees.parquet')
-    if (resParquet.ok) {
-      const buffer = new Uint8Array(await resParquet.arrayBuffer())
-      await db.registerFileBuffer('trees.parquet', buffer)
-      await conn.query(`INSERT INTO trees SELECT * FROM read_parquet('trees.parquet')`)
-      loadedTreesFromParquet = true
-    }
-  } catch {
-    // fallback below
-  }
-
-  if (!loadedTreesFromParquet) {
-    const res = await fetch(import.meta.env.BASE_URL + 'data/raw_data.json')
-    const jsonText = await res.text()
-    await db.registerFileText('trees.json', jsonText)
-    await conn.query(`INSERT INTO trees SELECT * FROM read_json_auto('trees.json')`)
-  }
+  await conn.query(`INSERT INTO trees SELECT * FROM read_parquet('${REMOTE_TREES_PARQUET_URL}')`)
 
   try {
-    let loadedSpeciesFromParquet = false
-    try {
-      const speciesParquetRes = await fetch(import.meta.env.BASE_URL + 'data/cache/species.parquet')
-      if (speciesParquetRes.ok) {
-        const buffer = new Uint8Array(await speciesParquetRes.arrayBuffer())
-        await db.registerFileBuffer('species.parquet', buffer)
-        await conn.query(`
-          INSERT INTO species_enrichment
-          SELECT
-            species,
-            tree_category,
-            native_status,
-            is_evergreen,
-            mature_height_ft,
-            bloom_season,
-            wildlife_value,
-            fire_risk
-          FROM read_parquet('species.parquet')
-        `)
-        loadedSpeciesFromParquet = true
-      }
-    } catch {
-      // fallback below
-    }
-
-    if (!loadedSpeciesFromParquet) {
-      const speciesRes = await fetch(import.meta.env.BASE_URL + 'data/species_data.json')
-      if (speciesRes.ok) {
-        const speciesJson = await speciesRes.text()
-        await db.registerFileText('species.json', speciesJson)
-        await conn.query(`
-          INSERT INTO species_enrichment
-          SELECT
-            species,
-            tree_category,
-            native_status,
-            is_evergreen,
-            mature_height_ft,
-            bloom_season,
-            wildlife_value,
-            fire_risk
-          FROM read_json_auto('species.json')
-        `)
-      }
-    }
+    await conn.query(`
+      INSERT INTO species_enrichment
+      SELECT
+        species,
+        tree_category,
+        native_status,
+        is_evergreen,
+        mature_height_ft,
+        bloom_season,
+        wildlife_value,
+        fire_risk
+      FROM read_parquet('${REMOTE_SPECIES_PARQUET_URL}')
+    `)
   } catch (e) {
     console.warn('[Perf] duckdb-worker:species-load:failed', e)
   }
 
   let loadedTreesFastFromParquet = false
   try {
-    const treesFastRes = await fetch(import.meta.env.BASE_URL + 'data/cache/trees_fast.parquet')
-    if (treesFastRes.ok) {
-      const buffer = new Uint8Array(await treesFastRes.arrayBuffer())
-      await db.registerFileBuffer('trees_fast.parquet', buffer)
-      await conn.query(`CREATE OR REPLACE TABLE trees_fast AS SELECT * FROM read_parquet('trees_fast.parquet')`)
-      loadedTreesFastFromParquet = true
-    }
+    await conn.query(`CREATE OR REPLACE TABLE trees_fast AS SELECT * FROM read_parquet('${REMOTE_TREES_FAST_PARQUET_URL}')`)
+    loadedTreesFastFromParquet = true
   } catch {
     // fallback below
   }
