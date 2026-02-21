@@ -423,7 +423,19 @@ async function doInit() {
   await conn.query(TABLE_DDL)
   await conn.query(SPECIES_DDL)
 
-  await conn.query(`INSERT INTO trees SELECT * FROM read_parquet('${REMOTE_TREES_PARQUET_URL}')`)
+  await conn.query(`
+    INSERT INTO trees
+    SELECT
+      tree_id,
+      coalesce(nullif(trim(string_split(species, '::')[2]), ''), trim(string_split(species, '::')[1])) AS common_name,
+      site_info,
+      plant_date,
+      species,
+      latitude,
+      longitude,
+      diameter_at_breast_height
+    FROM read_parquet('${REMOTE_TREES_PARQUET_URL}')
+  `)
 
   try {
     await conn.query(`
