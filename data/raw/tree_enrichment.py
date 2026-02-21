@@ -7,12 +7,15 @@
 import sys
 import math
 import base64
+import argparse
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import requests
 import duckdb
 from datetime import datetime, timezone
 from typing import Literal, Optional
+from dataclasses import dataclass
 from PIL import Image, ImageDraw, ImageFilter
 from pydantic import BaseModel, Field
 import instructor
@@ -427,8 +430,24 @@ def to_raw_rgba_b64(img: Image.Image) -> str:
 HEADERS = {"User-Agent": "sf-tree-enrichment/1.0 (github.com/sf-tree-reporting)"}
 
 
+@dataclass
+class SourceTexts:
+    wikipedia: str | None
+    powo: str | None
+    gbif: str | None
+
+
+def parse_scientific_name(q_species: str) -> str:
+    return q_species.split("::")[0].strip()
+
+
+def map_wikipedia_lookup(scientific_name: str) -> str:
+    return SYNONYMS.get(scientific_name.lower(), scientific_name)
+
+
 def fetch_wikipedia_text(scientific_name: str) -> str | None:
     slug = scientific_name.replace(" ", "_")
+    summary_extract: str | None = None
 
     # REST summary endpoint — concise intro paragraph, best for LLM context
     r = requests.get(
@@ -440,15 +459,17 @@ def fetch_wikipedia_text(scientific_name: str) -> str | None:
         data = r.json()
         extract = data.get("extract", "")
         if extract:
-            return extract
+            summary_extract = extract
 
-    # MediaWiki API fallback — fuller intro section, handles redirects
+    # MediaWiki API — fuller intro section, handles redirects.
+    # Prefer this when available because it is usually richer than REST summary.
     r = requests.get(
         "https://en.wikipedia.org/w/api.php",
         params={
             "action": "query",
             "prop": "extracts",
             "exintro": True,
+            "explaintext": True,
             "titles": scientific_name,
             "format": "json",
             "redirects": 1,
@@ -462,9 +483,11 @@ def fetch_wikipedia_text(scientific_name: str) -> str | None:
             if page.get("pageid", -1) != -1:
                 extract = page.get("extract", "")
                 if extract:
+                    if summary_extract and len(summary_extract) > len(extract):
+                        return summary_extract
                     return extract
 
-    return None
+    return summary_extract
 
 
 def fetch_powo_text(scientific_name: str) -> str | None:
@@ -485,9 +508,22 @@ def fetch_powo_text(scientific_name: str) -> str | None:
         results = r.json().get("results", [])
         if not results:
             return None
-        fq_id = results[0].get("fqId")
+        top = results[0]
+        fq_id = top.get("fqId")
         if not fq_id:
             return None
+
+        parts = []
+        if top.get("name"):
+            parts.append(f"POWO matched name: {top['name']}")
+        if top.get("author"):
+            parts.append(f"POWO author: {top['author']}")
+        if top.get("family"):
+            parts.append(f"POWO family: {top['family']}")
+        snippet = top.get("snippet")
+        if isinstance(snippet, str) and snippet.strip():
+            snippet_text = snippet.replace("<b>", "").replace("</b>", "")
+            parts.append(f"POWO snippet: {snippet_text}")
 
         r2 = requests.get(
             f"https://powo.science.kew.org/api/2/taxon/{fq_id}",
@@ -499,13 +535,30 @@ def fetch_powo_text(scientific_name: str) -> str | None:
             return None
         data = r2.json()
 
-        parts = []
-        for desc_block in data.get("descriptions", []):
-            for item in desc_block.get("descriptions", []):
-                char = item.get("characteristic", "")
-                text = item.get("description", "")
-                if text:
-                    parts.append(f"{char}: {text}" if char else text)
+        descriptions = data.get("descriptions", {})
+        if isinstance(descriptions, dict):
+            for source_name, source_payload in descriptions.items():
+                if not isinstance(source_payload, dict):
+                    continue
+                source_descriptions = source_payload.get("descriptions", {})
+                if not isinstance(source_descriptions, dict):
+                    continue
+                for characteristic, items in source_descriptions.items():
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        text = item.get("description", "")
+                        if text:
+                            parts.append(f"{source_name}/{characteristic}: {text}")
+
+        if data.get("lifeform"):
+            parts.append(f"Lifeform: {data['lifeform']}")
+        if data.get("climate"):
+            parts.append(f"Climate: {data['climate']}")
+        if data.get("taxonRemarks"):
+            parts.append(f"Taxon remarks: {data['taxonRemarks']}")
 
         # Include native distribution regions
         dist = data.get("distribution", {})
@@ -523,97 +576,240 @@ def fetch_powo_text(scientific_name: str) -> str | None:
 
 
 def fetch_wfo_text(scientific_name: str) -> str | None:
-    """Fetch taxonomic context from World Flora Online (WFO).
+    """Fetch taxonomic context from GBIF species match API.
 
-    WFO provides stable WFO-IDs, accepted names, and family/order
-    classification useful for resolving synonyms and taxonomy.
+    GBIF provides canonical names and family/order classification,
+    useful for resolving synonyms and taxonomy.
     """
     try:
         r = requests.get(
-            "https://list.worldfloraonline.org/api.php",
-            params={"terms": scientific_name, "fuzzy": "false", "full": "true"},
+            "https://api.gbif.org/v1/species/match",
+            params={"name": scientific_name, "verbose": "true"},
             headers=HEADERS,
             timeout=10,
         )
         if r.status_code != 200:
             return None
         data = r.json()
-        docs = data.get("docs", [])
-        if not docs:
+        usage_key = data.get("usageKey") or data.get("speciesKey")
+        if not usage_key:
             return None
-        doc = docs[0]
 
         parts = []
-        accepted = doc.get("acceptedNameScientificName") or doc.get("scientificName")
-        if accepted:
-            parts.append(f"Accepted scientific name: {accepted}")
-        if doc.get("family"):
-            parts.append(f"Family: {doc['family']}")
-        if doc.get("order"):
-            parts.append(f"Order: {doc['order']}")
-        if doc.get("taxonRemarks"):
-            parts.append(f"Notes: {doc['taxonRemarks']}")
-        if doc.get("nativeDistribution"):
-            parts.append(f"Native distribution: {doc['nativeDistribution']}")
+        if data.get("scientificName"):
+            parts.append(f"Matched scientific name: {data['scientificName']}")
+        if data.get("canonicalName"):
+            parts.append(f"Canonical name: {data['canonicalName']}")
+        if data.get("family"):
+            parts.append(f"Family: {data['family']}")
+        if data.get("order"):
+            parts.append(f"Order: {data['order']}")
+        if data.get("status"):
+            parts.append(f"Taxonomic status: {data['status']}")
+        if data.get("confidence") is not None:
+            parts.append(f"Match confidence: {data['confidence']}")
+
+        alternatives = data.get("alternatives")
+        if isinstance(alternatives, list) and alternatives:
+            alt_names = [a.get("scientificName") for a in alternatives[:3] if isinstance(a, dict) and a.get("scientificName")]
+            if alt_names:
+                parts.append(f"Alternative matches: {' | '.join(alt_names)}")
+
+        try:
+            vn = requests.get(
+                f"https://api.gbif.org/v1/species/{usage_key}/vernacularNames",
+                params={"limit": 20},
+                headers=HEADERS,
+                timeout=10,
+            )
+            if vn.status_code == 200:
+                vn_data = vn.json()
+                rows = vn_data.get("results", []) if isinstance(vn_data, dict) else []
+                names = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    lang = row.get("language")
+                    name = row.get("vernacularName")
+                    if not name:
+                        continue
+                    if lang and str(lang).lower().startswith("en"):
+                        names.append(name)
+                if names:
+                    uniq = []
+                    seen = set()
+                    for n in names:
+                        k = n.strip().lower()
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        uniq.append(n.strip())
+                    if uniq:
+                        parts.append(f"GBIF vernacular names (en): {', '.join(uniq[:8])}")
+        except Exception:
+            pass
 
         return "\n".join(parts) if parts else None
     except Exception:
         return None
 
 
-# ── Enrichment ─────────────────────────────────────────────────────────────────
-
-def enrich_species(q_species: str, client) -> TreeEnrichment | None:
-    scientific_name = q_species.split("::")[0].strip()
-    if not scientific_name:
-        return None
-    wiki_name = SYNONYMS.get(scientific_name.lower(), scientific_name)
-
-    # Gather text from all available sources
-    wiki_text  = fetch_wikipedia_text(wiki_name)
-    powo_text  = fetch_powo_text(scientific_name)
-    wfo_text   = fetch_wfo_text(scientific_name)
-
-    if not wiki_text and not powo_text and not wfo_text:
-        print(
-            f"  [skip] no content found for {scientific_name!r} (lookup: {wiki_name!r})",
-            file=sys.stderr,
-        )
-        return None
-
-    sources_used = ", ".join(
-        label for label, text in [("Wikipedia", wiki_text), ("POWO", powo_text), ("WFO", wfo_text)]
-        if text
+def gather_source_texts(scientific_name: str, wiki_name: str) -> SourceTexts:
+    return SourceTexts(
+        wikipedia=fetch_wikipedia_text(wiki_name),
+        powo=fetch_powo_text(scientific_name),
+        gbif=fetch_wfo_text(scientific_name),
     )
-    print(f"    [sources] {sources_used}", file=sys.stderr)
 
+
+def source_labels(texts: SourceTexts) -> list[str]:
+    labels = []
+    if texts.wikipedia:
+        labels.append("Wikipedia")
+    if texts.powo:
+        labels.append("POWO")
+    if texts.gbif:
+        labels.append("GBIF")
+    return labels
+
+
+def build_reference_text(texts: SourceTexts) -> str:
     context_parts = []
-    if wiki_text:
-        context_parts.append(f"Wikipedia:\n{wiki_text}")
-    if powo_text:
-        context_parts.append(f"Plants of the World Online (POWO / Kew):\n{powo_text}")
-    if wfo_text:
-        context_parts.append(f"World Flora Online (WFO):\n{wfo_text}")
-    combined_text = "\n\n".join(context_parts)
+    if texts.wikipedia:
+        context_parts.append(f"Wikipedia:\n{texts.wikipedia}")
+    if texts.powo:
+        context_parts.append(f"Plants of the World Online (POWO / Kew):\n{texts.powo}")
+    if texts.gbif:
+        context_parts.append(f"GBIF Species Match:\n{texts.gbif}")
+    return "\n\n".join(context_parts)
+
+
+def build_enrichment_prompt(scientific_name: str, wiki_name: str, reference_text: str) -> str:
+    return (
+        "You are enriching tree data for an urban forestry dataset in San Francisco, CA.\n"
+        "Extract structured information about this tree species from the reference text below.\n"
+        "Be conservative with numeric estimates — use None if the sources don't clearly state a value.\n\n"
+        f"Species: {scientific_name}\n\n"
+        f"Wikipedia lookup: {wiki_name}\n\n"
+        f"Reference text:\n{reference_text}"
+    )
+
+
+def parse_enrichment_from_text(
+    scientific_name: str,
+    wiki_name: str,
+    texts: SourceTexts,
+    client,
+    print_full_context: bool = False,
+) -> TreeEnrichment | None:
+    reference_text = build_reference_text(texts)
+    if not reference_text:
+        return None
+
+    if print_full_context:
+        print("[debug] BEGIN LLM REFERENCE TEXT", file=sys.stderr)
+        print(reference_text, file=sys.stderr)
+        print("[debug] END LLM REFERENCE TEXT", file=sys.stderr)
 
     try:
         return client.chat.completions.create(
             response_model=TreeEnrichment,
             messages=[{
                 "role": "user",
-                "content": (
-                    "You are enriching tree data for an urban forestry dataset in San Francisco, CA.\n"
-                    "Extract structured information about this tree species from the reference text below.\n"
-                    "Be conservative with numeric estimates — use None if the sources don't clearly state a value.\n\n"
-                    f"Species: {scientific_name}\n\n"
-                    f"Wikipedia lookup: {wiki_name}\n\n"
-                    f"Reference text:\n{combined_text}"
-                ),
+                "content": build_enrichment_prompt(scientific_name, wiki_name, reference_text),
             }],
         )
     except Exception as e:
         print(f"  [error] instructor failed for {scientific_name!r}: {e}", file=sys.stderr)
         return None
+
+
+def debug_print_source_details(texts: SourceTexts, preview_chars: int = 500) -> None:
+    entries = [
+        ("Wikipedia", texts.wikipedia),
+        ("POWO", texts.powo),
+        ("GBIF", texts.gbif),
+    ]
+    for label, text in entries:
+        if text:
+            preview = text[:preview_chars].replace("\n", "\\n")
+            print(f"[debug] {label}: present ({len(text)} chars)", file=sys.stderr)
+            print(f"[debug] {label} preview: {preview}", file=sys.stderr)
+        else:
+            print(f"[debug] {label}: missing", file=sys.stderr)
+
+
+def run_standalone_debug(q_species: str, client) -> int:
+    scientific_name = parse_scientific_name(q_species)
+    if not scientific_name:
+        print("[debug] empty species", file=sys.stderr)
+        return 2
+
+    wiki_name = map_wikipedia_lookup(scientific_name)
+    print(f"[debug] input: {q_species}", file=sys.stderr)
+    print(f"[debug] scientific_name: {scientific_name}", file=sys.stderr)
+    print(f"[debug] wikipedia_lookup: {wiki_name}", file=sys.stderr)
+
+    texts = gather_source_texts(scientific_name, wiki_name)
+    labels = source_labels(texts)
+    if labels:
+        print(f"[debug] sources: {', '.join(labels)}", file=sys.stderr)
+    else:
+        print("[debug] sources: none", file=sys.stderr)
+
+    debug_print_source_details(texts)
+
+    reference_text = build_reference_text(texts)
+    print(f"[debug] combined_reference_chars: {len(reference_text)}", file=sys.stderr)
+
+    enrichment = parse_enrichment_from_text(
+        scientific_name,
+        wiki_name,
+        texts,
+        client,
+        print_full_context=True,
+    )
+    if enrichment is None:
+        print("[debug] enrichment: none", file=sys.stderr)
+        return 1
+
+    is_complete, missing = compute_is_complete(enrichment)
+    print("[debug] parsed enrichment JSON:", file=sys.stderr)
+    print(enrichment.model_dump_json(indent=2), file=sys.stderr)
+    if is_complete:
+        print("[debug] completeness: complete", file=sys.stderr)
+    else:
+        print(f"[debug] completeness: incomplete; missing: {', '.join(missing)}", file=sys.stderr)
+    return 0
+
+
+# ── Enrichment ─────────────────────────────────────────────────────────────────
+
+def enrich_species(q_species: str, client, print_full_context: bool = False) -> TreeEnrichment | None:
+    scientific_name = parse_scientific_name(q_species)
+    if not scientific_name:
+        return None
+    wiki_name = map_wikipedia_lookup(scientific_name)
+
+    # Gather text from all available sources
+    texts = gather_source_texts(scientific_name, wiki_name)
+    labels = source_labels(texts)
+
+    if not labels:
+        print(
+            f"  [skip] no content found for {scientific_name!r} (lookup: {wiki_name!r})",
+            file=sys.stderr,
+        )
+        return None
+
+    print(f"    [sources] {', '.join(labels)}", file=sys.stderr)
+    return parse_enrichment_from_text(
+        scientific_name,
+        wiki_name,
+        texts,
+        client,
+        print_full_context=print_full_context,
+    )
 
 
 # ── Species list ───────────────────────────────────────────────────────────────
@@ -677,20 +873,26 @@ def get_already_enriched() -> tuple[set[str], set[str]]:
         conn.close()
 
 
-def compute_is_complete(enrichment: TreeEnrichment) -> bool:
-    """True only when every core field has a non-null extracted value."""
-    return all([
-        bool(enrichment.common_names),
-        enrichment.is_evergreen      is not None,
-        enrichment.mature_height_ft  is not None,
-        enrichment.canopy_spread_ft  is not None,
-        enrichment.growth_rate       is not None,
-        enrichment.lifespan_years    is not None,
-        enrichment.drought_tolerance is not None,
-        enrichment.bloom_season      is not None,
-        enrichment.wildlife_value    is not None,
-        enrichment.fire_risk         is not None,
-    ])
+def compute_is_complete(enrichment: TreeEnrichment) -> tuple[bool, list[str]]:
+    """Return (is_complete, missing_fields).
+
+    is_complete is True only when every core Optional field is non-null.
+    missing_fields lists the names of any fields that are still None/empty.
+    """
+    checks = [
+        ("common_names",    bool(enrichment.common_names)),
+        ("is_evergreen",    enrichment.is_evergreen      is not None),
+        ("mature_height_ft",enrichment.mature_height_ft  is not None),
+        ("canopy_spread_ft",enrichment.canopy_spread_ft  is not None),
+        ("growth_rate",     enrichment.growth_rate       is not None),
+        ("lifespan_years",  enrichment.lifespan_years    is not None),
+        ("drought_tolerance",enrichment.drought_tolerance is not None),
+        ("bloom_season",    enrichment.bloom_season      is not None),
+        ("wildlife_value",  enrichment.wildlife_value    is not None),
+        ("fire_risk",       enrichment.fire_risk         is not None),
+    ]
+    missing = [name for name, ok in checks if not ok]
+    return len(missing) == 0, missing
 
 
 # ── Arrow table ────────────────────────────────────────────────────────────────
@@ -729,6 +931,32 @@ def emit(table: pa.Table) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--debug-species",
+        dest="debug_species",
+        help="Run standalone parsing debug for a single species, e.g. \"Abutilon hybridum :: Flowering maple\"",
+    )
+    parser.add_argument(
+        "--print-llm-context",
+        action="store_true",
+        help="Print full concatenated source text sent to the LLM for each processed species.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process at most N species and write the result to a local parquet file instead of emitting to stdout.",
+    )
+    parser.add_argument(
+        "--output",
+        default="tree_enrichment.parquet",
+        metavar="PATH",
+        help="Local parquet file to write when --limit is set (default: tree_enrichment.parquet).",
+    )
+    args = parser.parse_args()
+
     client = instructor.from_provider(
         "google/gemini-2.5-pro",
         vertexai=True,
@@ -736,10 +964,15 @@ if __name__ == "__main__":
         location="us-central1"      # e.g., us-central1, europe-west1
     )
 
+    if args.debug_species:
+        raise SystemExit(run_standalone_debug(args.debug_species, client))
+
     already_enriched, complete_enriched = get_already_enriched()
     all_species = get_all_species()
     # Process species that are new OR previously enriched but incomplete
     to_process = [s for s in all_species if s not in complete_enriched]
+    if args.limit is not None:
+        to_process = to_process[:args.limit]
     incomplete_count = sum(1 for s in to_process if s in already_enriched)
 
     print(
@@ -754,13 +987,16 @@ if __name__ == "__main__":
     for q_species in to_process:
         status = "re-enrich" if q_species in already_enriched else "new"
         print(f"  [{status}] {q_species}", file=sys.stderr)
-        enrichment = enrich_species(q_species, client)
+        enrichment = enrich_species(q_species, client, print_full_context=args.print_llm_context)
         if enrichment is None:
             continue
 
         icon = draw_tree_icon(enrichment.tree_category)
-        is_complete = compute_is_complete(enrichment)
-        print(f"    [complete={is_complete}]", file=sys.stderr)
+        is_complete, missing = compute_is_complete(enrichment)
+        if missing:
+            print(f"    [incomplete] missing: {', '.join(missing)}", file=sys.stderr)
+        else:
+            print(f"    [complete]", file=sys.stderr)
         new_rows.append({
             "species":          q_species,
             "common_names":     ", ".join(enrichment.common_names),
@@ -857,4 +1093,8 @@ if __name__ == "__main__":
     else:
         merged = build_table(new_rows)
 
-    emit(merged)
+    if args.limit is not None:
+        pq.write_table(merged, args.output)
+        print(f"[info] wrote {len(merged)} rows to {args.output}", file=sys.stderr)
+    else:
+        emit(merged)
