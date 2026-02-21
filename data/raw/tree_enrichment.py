@@ -5,9 +5,13 @@
 # ///
 
 import sys
+import os
 import math
 import base64
 import argparse
+import re
+import html
+import subprocess
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -22,6 +26,7 @@ import instructor
 
 ICON_SIZE = 48
 ENRICHMENT_PARQUET = "https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_enrichment.parquet"
+ENRICHMENT_GCS_URI  = "gs://trilogy_public_models/duckdb/sf_trees/tree_enrichment.parquet"
 TREE_INFO_PARQUET = "https://storage.googleapis.com/trilogy_public_models/duckdb/sf_trees/tree_info.parquet"
 
 
@@ -435,6 +440,7 @@ class SourceTexts:
     wikipedia: str | None
     powo: str | None
     gbif: str | None
+    selectree: str | None
 
 
 def parse_scientific_name(q_species: str) -> str:
@@ -575,7 +581,7 @@ def fetch_powo_text(scientific_name: str) -> str | None:
         return None
 
 
-def fetch_wfo_text(scientific_name: str) -> str | None:
+def fetch_gbif_text(scientific_name: str) -> str | None:
     """Fetch taxonomic context from GBIF species match API.
 
     GBIF provides canonical names and family/order classification,
@@ -654,11 +660,122 @@ def fetch_wfo_text(scientific_name: str) -> str | None:
         return None
 
 
+def fetch_selectree_text(scientific_name: str) -> str | None:
+    """Fetch rich structured tree metadata from SelecTree APIs."""
+    def clean_value(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value)
+        text = str(value)
+        text = html.unescape(text)
+        text = re.sub(r"<[^>]+>", "", text)
+        return text.strip()
+
+    try:
+        search_resp = requests.get(
+            "https://selectree.calpoly.edu/api/tree/search-by-name-multiresult",
+            params={
+                "region": "",
+                "searchTerm": scientific_name,
+                "activePage": 1,
+                "resultsPerPage": 30,
+                "sort": 1,
+            },
+            headers=HEADERS,
+            timeout=12,
+        )
+        if search_resp.status_code != 200:
+            return None
+
+        payload = search_resp.json()
+        rows = payload.get("pageResults", []) if isinstance(payload, dict) else []
+        if not rows:
+            return None
+
+        selected = rows[0]
+        target = scientific_name.strip().lower()
+        for row in rows:
+            accepted = str(row.get("accepted_scientific") or "").strip().lower()
+            raw_name = str(row.get("name_concat") or "").strip().lower()
+            if accepted == target or raw_name == target:
+                selected = row
+                break
+
+        tree_id = selected.get("tree_id")
+        if not tree_id:
+            return None
+
+        parts = [
+            f"SelecTree tree_id: {tree_id}",
+            f"SelecTree accepted scientific: {clean_value(selected.get('accepted_scientific') or selected.get('name_concat') or scientific_name)}",
+        ]
+
+        if selected.get("common"):
+            parts.append(f"SelecTree common name: {clean_value(selected['common'])}")
+        if selected.get("family"):
+            parts.append(f"SelecTree family: {clean_value(selected['family'])}")
+        if selected.get("height_high"):
+            parts.append(f"SelecTree reported max height: {selected['height_high']} ft")
+
+        detail_resp = requests.get(
+            f"https://selectree.calpoly.edu/api/tree/detail/{tree_id}",
+            headers=HEADERS,
+            timeout=12,
+        )
+        if detail_resp.status_code == 200:
+            detail = detail_resp.json()
+            if isinstance(detail, dict):
+                if detail.get("memo"):
+                    parts.append(f"SelecTree memo: {clean_value(detail['memo'])}")
+                if detail.get("native_range"):
+                    parts.append(f"SelecTree native range: {clean_value(detail['native_range'])}")
+                if detail.get("foliage_type"):
+                    parts.append(f"SelecTree foliage type: {clean_value(detail['foliage_type'])}")
+                if detail.get("growth_rate_low") or detail.get("growth_rate_high"):
+                    parts.append(
+                        f"SelecTree growth rate range: {detail.get('growth_rate_low')} to {detail.get('growth_rate_high')}"
+                    )
+                if detail.get("width_low") or detail.get("width_high"):
+                    parts.append(f"SelecTree canopy width range: {detail.get('width_low')} to {detail.get('width_high')} ft")
+                if detail.get("height_low") or detail.get("height_high"):
+                    parts.append(f"SelecTree height range: {detail.get('height_low')} to {detail.get('height_high')} ft")
+                if detail.get("water_use"):
+                    parts.append(f"SelecTree water use: {clean_value(detail['water_use'])}")
+                if detail.get("flower_time"):
+                    parts.append(f"SelecTree flower time: {clean_value(detail['flower_time'])}")
+                if detail.get("flower_showiness"):
+                    parts.append(f"SelecTree flower showiness: {clean_value(detail['flower_showiness'])}")
+                if detail.get("fruiting_time"):
+                    parts.append(f"SelecTree fruiting time: {clean_value(detail['fruiting_time'])}")
+                if detail.get("attracts_wildlife"):
+                    parts.append(f"SelecTree attracts wildlife: {clean_value(detail['attracts_wildlife'])}")
+                if detail.get("disease_resistant"):
+                    parts.append(f"SelecTree disease resistant: {clean_value(detail['disease_resistant'])}")
+                if detail.get("pest_resistant"):
+                    parts.append(f"SelecTree pest resistant: {clean_value(detail['pest_resistant'])}")
+
+                # Common names from detail payload
+                primary_common = detail.get("primary_common") or {}
+                if isinstance(primary_common, dict) and primary_common.get("common"):
+                    parts.append(f"SelecTree primary common: {clean_value(primary_common['common'])}")
+                other_common = detail.get("other_common") or []
+                if isinstance(other_common, list):
+                    names = [clean_value(row.get("common")) for row in other_common if isinstance(row, dict) and row.get("common")]
+                    if names:
+                        parts.append(f"SelecTree other common names: {', '.join(names[:10])}")
+
+        return "\n".join(parts)
+    except Exception:
+        return None
+
+
 def gather_source_texts(scientific_name: str, wiki_name: str) -> SourceTexts:
     return SourceTexts(
         wikipedia=fetch_wikipedia_text(wiki_name),
         powo=fetch_powo_text(scientific_name),
-        gbif=fetch_wfo_text(scientific_name),
+        gbif=fetch_gbif_text(scientific_name),
+        selectree=fetch_selectree_text(scientific_name),
     )
 
 
@@ -670,6 +787,8 @@ def source_labels(texts: SourceTexts) -> list[str]:
         labels.append("POWO")
     if texts.gbif:
         labels.append("GBIF")
+    if texts.selectree:
+        labels.append("SelecTree")
     return labels
 
 
@@ -681,6 +800,8 @@ def build_reference_text(texts: SourceTexts) -> str:
         context_parts.append(f"Plants of the World Online (POWO / Kew):\n{texts.powo}")
     if texts.gbif:
         context_parts.append(f"GBIF Species Match:\n{texts.gbif}")
+    if texts.selectree:
+        context_parts.append(f"SelecTree:\n{texts.selectree}")
     return "\n\n".join(context_parts)
 
 
@@ -729,6 +850,7 @@ def debug_print_source_details(texts: SourceTexts, preview_chars: int = 500) -> 
         ("Wikipedia", texts.wikipedia),
         ("POWO", texts.powo),
         ("GBIF", texts.gbif),
+        ("SelecTree", texts.selectree),
     ]
     for label, text in entries:
         if text:
@@ -834,8 +956,24 @@ def get_all_species() -> list[str]:
         conn.close()
 
 
-def get_already_enriched() -> tuple[set[str], set[str]]:
-    """Return (all_enriched, complete_enriched).
+_COMPLETENESS_EXPR = """
+    (common_names IS NOT NULL AND trim(common_names) != ''
+     AND native_status IS NOT NULL
+     AND is_evergreen IS NOT NULL
+     AND mature_height_ft IS NOT NULL
+     AND canopy_spread_ft IS NOT NULL
+     AND growth_rate IS NOT NULL
+     AND lifespan_years IS NOT NULL
+     AND drought_tolerance IS NOT NULL
+     AND bloom_season IS NOT NULL
+     AND wildlife_value IS NOT NULL
+     AND fire_risk IS NOT NULL
+     AND tree_category IS NOT NULL)
+""".strip()
+
+
+def get_already_enriched(source: str = ENRICHMENT_PARQUET) -> tuple[set[str], set[str]]:
+    """Return (all_enriched, complete_enriched) from *source* (local path or https URL).
 
     'complete' means every core Optional field has a non-null extracted value.
     Completeness is computed from existing column values so it works even before
@@ -844,25 +982,12 @@ def get_already_enriched() -> tuple[set[str], set[str]]:
     conn = duckdb.connect()
     try:
         rows = conn.execute(
-            """
-            SELECT
-              species,
-              (common_names IS NOT NULL AND trim(common_names) != ''
-               AND native_status IS NOT NULL
-               AND is_evergreen IS NOT NULL
-               AND mature_height_ft IS NOT NULL
-               AND canopy_spread_ft IS NOT NULL
-               AND growth_rate IS NOT NULL
-               AND lifespan_years IS NOT NULL
-               AND drought_tolerance IS NOT NULL
-               AND bloom_season IS NOT NULL
-               AND wildlife_value IS NOT NULL
-               AND fire_risk IS NOT NULL
-               AND tree_category IS NOT NULL) AS is_complete
+            f"""
+            SELECT species, {_COMPLETENESS_EXPR} AS is_complete
             FROM read_parquet(?)
             WHERE species IS NOT NULL
             """,
-            [ENRICHMENT_PARQUET],
+            [source],
         ).fetchall()
         all_enriched      = {row[0] for row in rows}
         complete_enriched = {row[0] for row in rows if row[1]}
@@ -871,6 +996,64 @@ def get_already_enriched() -> tuple[set[str], set[str]]:
         return set(), set()
     finally:
         conn.close()
+
+
+def load_existing_table(source: str) -> pa.Table | None:
+    """Load the full enrichment parquet from *source*, computing is_complete inline."""
+    conn = duckdb.connect()
+    try:
+        table = conn.execute(
+            f"""
+            SELECT
+              species, common_names, native_status, is_evergreen,
+              mature_height_ft, canopy_spread_ft, growth_rate, lifespan_years,
+              drought_tolerance, bloom_season, wildlife_value, fire_risk,
+              tree_category,
+              {_COMPLETENESS_EXPR} AS is_complete,
+              icon_rgba_b64, icon_width, icon_height, enriched_at
+            FROM read_parquet(?)
+            """,
+            [source],
+        ).fetch_arrow_table()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+    # Normalize enriched_at timezone metadata if needed
+    tz_idx = table.schema.get_field_index("enriched_at")
+    if tz_idx >= 0:
+        target_ts  = SCHEMA.field("enriched_at").type
+        current_ts = table.schema.field(tz_idx).type
+        if current_ts != target_ts:
+            table = table.set_column(
+                tz_idx, "enriched_at",
+                pc.cast(table.column(tz_idx), target_ts, safe=False),
+            )
+    return table
+
+
+def merge_with_existing(existing: pa.Table | None, new_rows: list[dict]) -> pa.Table:
+    """Merge *new_rows* into *existing*, replacing any species that appear in new_rows."""
+    new_table = build_table(new_rows)
+    if existing is None or len(existing) == 0:
+        return new_table
+    re_processed = pa.array([row["species"] for row in new_rows])
+    keep_mask = pc.invert(pc.is_in(existing.column("species"), re_processed))
+    return pa.concat_tables([existing.filter(keep_mask), new_table])
+
+
+def upload_to_gcs(local_path: str, gcs_uri: str) -> None:
+    """Copy *local_path* to *gcs_uri* using gsutil."""
+    print(f"[info] uploading {local_path} → {gcs_uri}", file=sys.stderr)
+    result = subprocess.run(
+        ["gsutil", "cp", local_path, gcs_uri],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("[info] upload complete", file=sys.stderr)
+    else:
+        print(f"[error] gsutil upload failed:\n{result.stderr.strip()}", file=sys.stderr)
 
 
 def compute_is_complete(enrichment: TreeEnrichment) -> tuple[bool, list[str]]:
@@ -947,13 +1130,24 @@ if __name__ == "__main__":
         type=int,
         default=None,
         metavar="N",
-        help="Process at most N species and write the result to a local parquet file instead of emitting to stdout.",
+        help=(
+            "Process at most N species. Writes checkpoints to --output and uploads "
+            "to GCS at the end. Reads progress from the local file instead of remote."
+        ),
     )
     parser.add_argument(
         "--output",
         default="tree_enrichment.parquet",
         metavar="PATH",
-        help="Local parquet file to write when --limit is set (default: tree_enrichment.parquet).",
+        help="Local parquet checkpoint file used with --limit (default: tree_enrichment.parquet).",
+    )
+    parser.add_argument(
+        "--flush-every",
+        dest="flush_every",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Write a checkpoint to --output every N successfully enriched species (default: 10).",
     )
     args = parser.parse_args()
 
@@ -967,11 +1161,20 @@ if __name__ == "__main__":
     if args.debug_species:
         raise SystemExit(run_standalone_debug(args.debug_species, client))
 
-    already_enriched, complete_enriched = get_already_enriched()
+    # In local-refresh mode, read progress from the local checkpoint if it exists;
+    # otherwise fall back to the remote parquet.
+    local_mode = args.limit is not None
+    if local_mode and os.path.exists(args.output):
+        enrichment_source = args.output
+        print(f"[info] local mode: reading progress from {args.output}", file=sys.stderr)
+    else:
+        enrichment_source = ENRICHMENT_PARQUET
+
+    already_enriched, complete_enriched = get_already_enriched(enrichment_source)
     all_species = get_all_species()
     # Process species that are new OR previously enriched but incomplete
     to_process = [s for s in all_species if s not in complete_enriched]
-    if args.limit is not None:
+    if local_mode:
         to_process = to_process[:args.limit]
     incomplete_count = sum(1 for s in to_process if s in already_enriched)
 
@@ -982,6 +1185,9 @@ if __name__ == "__main__":
         f"{len(to_process)} to process",
         file=sys.stderr,
     )
+
+    # Pre-load existing table once so every checkpoint flush is cheap.
+    existing_table = load_existing_table(enrichment_source) if already_enriched else None
 
     new_rows: list[dict] = []
     for q_species in to_process:
@@ -1018,83 +1224,20 @@ if __name__ == "__main__":
             "enriched_at":      datetime.now(tz=timezone.utc),
         })
 
-    # Merge with existing remote enrichment data and emit full merged output.
-    # Trilogy persists the datasource output to configured storage.
-    # Species we just processed replace their old rows (handles re-enrichment).
-    re_processed = {row["species"] for row in new_rows}
+        # Periodic checkpoint flush
+        if local_mode and len(new_rows) % args.flush_every == 0:
+            checkpoint = merge_with_existing(existing_table, new_rows)
+            pq.write_table(checkpoint, args.output)
+            print(
+                f"  [checkpoint] {len(new_rows)} new rows written to {args.output}",
+                file=sys.stderr,
+            )
 
-    if already_enriched:
-        conn = duckdb.connect()
-        try:
-            existing = conn.execute(
-                """
-                SELECT
-                  species,
-                  common_names,
-                  native_status,
-                  is_evergreen,
-                  mature_height_ft,
-                  canopy_spread_ft,
-                  growth_rate,
-                  lifespan_years,
-                  drought_tolerance,
-                  bloom_season,
-                  wildlife_value,
-                  fire_risk,
-                  tree_category,
-                  (common_names IS NOT NULL AND trim(common_names) != ''
-                   AND native_status IS NOT NULL
-                   AND is_evergreen IS NOT NULL
-                   AND mature_height_ft IS NOT NULL
-                   AND canopy_spread_ft IS NOT NULL
-                   AND growth_rate IS NOT NULL
-                   AND lifespan_years IS NOT NULL
-                   AND drought_tolerance IS NOT NULL
-                   AND bloom_season IS NOT NULL
-                   AND wildlife_value IS NOT NULL
-                   AND fire_risk IS NOT NULL
-                   AND tree_category IS NOT NULL) AS is_complete,
-                  icon_rgba_b64,
-                  icon_width,
-                  icon_height,
-                  enriched_at
-                FROM read_parquet(?)
-                """,
-                [ENRICHMENT_PARQUET],
-            ).fetch_arrow_table()
-        except Exception:
-            existing = None
-        finally:
-            conn.close()
+    merged = merge_with_existing(existing_table, new_rows)
 
-        if existing is not None:
-            # Drop rows for species we just re-processed so new results replace them
-            if re_processed:
-                keep_mask = pc.invert(
-                    pc.is_in(existing.column("species"), pa.array(sorted(re_processed)))
-                )
-                existing = existing.filter(keep_mask)
-
-            # Normalize enriched_at timezone metadata if needed
-            tz_idx = existing.schema.get_field_index("enriched_at")
-            if tz_idx >= 0:
-                target_ts = SCHEMA.field("enriched_at").type
-                current_ts = existing.schema.field(tz_idx).type
-                if current_ts != target_ts:
-                    existing = existing.set_column(
-                        tz_idx,
-                        "enriched_at",
-                        pc.cast(existing.column(tz_idx), target_ts, safe=False),
-                    )
-
-            merged = pa.concat_tables([existing, build_table(new_rows)])
-        else:
-            merged = build_table(new_rows)
-    else:
-        merged = build_table(new_rows)
-
-    if args.limit is not None:
+    if local_mode:
         pq.write_table(merged, args.output)
         print(f"[info] wrote {len(merged)} rows to {args.output}", file=sys.stderr)
+        upload_to_gcs(args.output, ENRICHMENT_GCS_URI)
     else:
         emit(merged)

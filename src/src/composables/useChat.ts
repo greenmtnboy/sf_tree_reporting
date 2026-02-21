@@ -145,6 +145,16 @@ Be concise and helpful. When showing query results, format them nicely.`,
 const messages = ref<ChatMessage[]>([])
 const isLoading = ref(false)
 const apiKey = ref(localStorage.getItem(API_KEY_STORAGE) || '')
+const pendingNavigationTimers: number[] = []
+
+function cancelPendingNavigationTimers() {
+  while (pendingNavigationTimers.length > 0) {
+    const timerId = pendingNavigationTimers.pop()
+    if (timerId != null) {
+      window.clearTimeout(timerId)
+    }
+  }
+}
 
 export function useChat() {
   const { query: duckQuery } = useDuckDB()
@@ -269,6 +279,8 @@ WHERE tree_id IS NOT NULL
           }
         }
         case 'navigate': {
+          cancelPendingNavigationTimers()
+
           const { latitude, longitude, zoom, locations } = input as {
             latitude?: number
             longitude?: number
@@ -284,7 +296,10 @@ WHERE tree_id IS NOT NULL
             flyTo(stops[0])
             for (let i = 1; i < stops.length; i++) {
               const stop = stops[i]
-              setTimeout(() => flyTo(stop), i * 6000)
+              const timerId = window.setTimeout(() => {
+                flyTo(stop)
+              }, i * 6000)
+              pendingNavigationTimers.push(timerId)
             }
             return {
               result: `Touring ${stops.length} locations (3s between each stop).`,

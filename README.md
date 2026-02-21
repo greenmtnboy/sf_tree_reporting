@@ -1,6 +1,6 @@
 # SF Tree Reporting
 
-An interactive browser-based map of San Francisco's urban forest. Explore approximately 10,000 street trees by location, species, and ecological attributes.
+An interactive browser-based map of San Francisco's urban forest. Explore hundreds of thousands of street trees by location, species, and ecological attributes.
 
 **[Live page](https://greenmtnboy.github.io/sf_tree_reporting/)**
 
@@ -8,17 +8,13 @@ An interactive browser-based map of San Francisco's urban forest. Explore approx
 
 ## What it does
 
-The application loads San Francisco street tree records into an in-browser DuckDB instance and renders them on a MapLibre GL map. Tree display adapts across zoom levels:
-
-- At low zoom: per-category heatmaps show density
-- At medium zoom: colored circles scaled to trunk diameter
-- At close zoom: silhouette icons by tree category (palm, broadleaf, spreading, coniferous, columnar, ornamental)
+The page loads San Francisco street tree records into an in-browser DuckDB instance and renders them on a MapLibre GL map with adaptive display.
 
 Clicking a tree opens a popup with its common name, species, planting date, trunk diameter, site description, and enriched species data (native status, evergreen status, mature height, bloom season, wildlife value, fire risk).
 
 The sidebar lists San Francisco landmarks with a search filter; clicking one flies the map camera to that location.
 
-A chat panel (requires an Anthropic API key entered at runtime) accepts natural language questions about the tree dataset. The assistant can query trees using Trilogy/PreQL, filter the map to show a subset of trees, and navigate the camera to locations by name or coordinate.
+A chat panel (requires an Anthropic API key entered at runtime) accepts natural language questions about the tree dataset. The assistant can query trees using Trilogy, filter the map to show a subset of trees, and navigate the camera to locations by name or coordinate.
 
 ---
 
@@ -35,7 +31,8 @@ Per-species attributes (native status, evergreen, mature height, canopy spread, 
 
 - Wikipedia REST API and MediaWiki API
 - Plants of the World Online (POWO / Kew) — powo.science.kew.org
-- World Flora Online (WFO) — list.worldfloraonline.org
+- GBIF species APIs — api.gbif.org
+- SelecTree (Cal Poly UFEI) APIs — selectree.calpoly.edu
 
 Structured fields are extracted from that text using Google Gemini 2.5 Pro (via `instructor` + `litellm`) and written to Parquet. The enrichment Parquet is served from Google Cloud Storage.
 
@@ -69,3 +66,7 @@ Data pipeline dependencies: Python 3.13, PyArrow, DuckDB, Pillow, instructor, go
 ## Repository
 
 https://github.com/greenmtnboy/sf_tree_reporting
+
+## Similar
+
+[Urban Forestry](https://bsm.sfdpw.org/urbanforestry/)

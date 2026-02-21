@@ -35,6 +35,7 @@ let activeTreePopup: maplibregl.Popup | null = null
 let popupRequestToken = 0
 let treesSourceReloadNonce = 0
 let zoomControlLabelEl: HTMLDivElement | null = null
+let pendingSwoopFlyTimeout: number | null = null
 const lastVisibleRangeSigByZoom = new Map<number, string>()
 const introLockedRangeByZoom = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>()
 
@@ -1142,6 +1143,13 @@ function bearingTo(from: [number, number], to: [number, number]): number {
 // Swoop camera to landmark — pivot to face the target first, then fly
 watch(flyToTarget, (t) => {
   if (!map || !t) return
+
+  if (pendingSwoopFlyTimeout != null) {
+    window.clearTimeout(pendingSwoopFlyTimeout)
+    pendingSwoopFlyTimeout = null
+  }
+  map.stop()
+
   const center = map.getCenter()
   const targetBearing = bearingTo([center.lng, center.lat], [t.lng, t.lat])
 
@@ -1152,7 +1160,7 @@ watch(flyToTarget, (t) => {
     easing: (x) => x * (2 - x), // ease-out quad
   })
   // Kick off the fly before the rotation fully settles so they overlap
-  setTimeout(() => {
+  pendingSwoopFlyTimeout = window.setTimeout(() => {
     map!.flyTo({
       center: [t.lng, t.lat],
       zoom: t.zoom ?? 16,
@@ -1161,12 +1169,17 @@ watch(flyToTarget, (t) => {
       duration: 3200,
       essential: true,
     })
+    pendingSwoopFlyTimeout = null
   }, 2200)
 })
 
 onUnmounted(() => {
   introCancelled = true
   if (introRafId != null) cancelAnimationFrame(introRafId)
+  if (pendingSwoopFlyTimeout != null) {
+    window.clearTimeout(pendingSwoopFlyTimeout)
+    pendingSwoopFlyTimeout = null
+  }
   if (activeTreePopup) {
     activeTreePopup.remove()
     activeTreePopup = null
