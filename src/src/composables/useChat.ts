@@ -23,7 +23,7 @@ interface HistoryMsg {
   toolResults?: Array<{ toolCallId: string; toolName: string; result: string }>
 }
 
-const ALL_CATEGORIES = new Set(['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default'])
+const _ALL_CATEGORIES = new Set(['palm', 'broadleaf', 'spreading', 'coniferous', 'columnar', 'ornamental', 'default'])
 
 const TOOLS = [
   {

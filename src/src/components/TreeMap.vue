@@ -625,7 +625,7 @@ function formatPopupHtml(row: any, enrichment?: ReturnType<typeof getSpeciesEnri
   const detailLines = [
     ['ID', row.tree_id],
     ['Planted', planted],
-    ['DBH', row.diameter_at_breast_height != null ? `${row.diameter_at_breast_height}\"` : null],
+    ['DBH', row.diameter_at_breast_height != null ? `${row.diameter_at_breast_height}"` : null],
     ['Site', row.site_info],
     ['Native', enrichment?.native_status],
     ['Evergreen', evergreen],
