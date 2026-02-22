@@ -14,11 +14,15 @@ import { useMapData } from '../composables/useMapData'
 import { useDuckDB } from '../composables/useDuckDB'
 import type { TreeCategory } from '../types'
 
+const props = defineProps<{
+  simplified?: boolean
+}>()
+
 const mapContainer = ref<HTMLDivElement>()
 const zoomLevel = ref(13)
 const mapError = ref<string | null>(null)
 const defaultQueryLoading = ref(true)
-const introActive = ref(true)
+const introActive = ref(!props.simplified)
 const loadingMessage = ref('Counting our conifers...')
 let map: maplibregl.Map | null = null
 let mapInitStartedAt = 0
@@ -712,7 +716,8 @@ function addTreeLayers() {
 
   // Prefer in-place source URL refresh to avoid tearing down layers, which can
   // cause visible pop during LOD transitions and query revision updates.
-  if (existingSource && hasHeatLayers && hasCircleLayer && hasIconLayer) {
+  const hasAllLayers = hasHeatLayers && hasCircleLayer && (props.simplified || hasIconLayer)
+  if (existingSource && hasAllLayers) {
     if (typeof existingSource.setTiles === 'function') {
       existingSource.setTiles(treeTiles)
       if (typeof existingSource.reload === 'function') {
@@ -790,27 +795,34 @@ function addTreeLayers() {
     })
   }
 
-  // Layer 2: Colored circles at medium zoom
+  // Layer 2: Colored circles at medium zoom (extended to all zoom levels in simplified mode)
   mapInstance.addLayer({
     id: 'trees-circle',
     type: 'circle',
     source: 'trees',
     'source-layer': 'trees',
     minzoom: CIRCLE_ZOOM_MIN,
-    maxzoom: CIRCLE_ZOOM_MAX,
+    ...(props.simplified ? {} : { maxzoom: CIRCLE_ZOOM_MAX }),
     paint: {
       'circle-radius': [
         ...buildCircleRadiusExpression(),
       ],
       'circle-color': buildColorExpression(),
-      'circle-opacity': [
-        'interpolate', ['linear'], ['zoom'],
-        CIRCLE_ZOOM_OPACITY_START, 0,
-        CIRCLE_ZOOM_OPACITY_START+.1, 0.75,
-        CIRCLE_ZOOM_OPACITY_MID, 0.92,
-        CIRCLE_ZOOM_OPACITY_END - .1, .75,
-        CIRCLE_ZOOM_OPACITY_END, 0,
-      ],
+      'circle-opacity': props.simplified
+        ? [
+            'interpolate', ['linear'], ['zoom'],
+            CIRCLE_ZOOM_OPACITY_START, 0,
+            CIRCLE_ZOOM_OPACITY_START + 0.1, 0.85,
+            MAX_ZOOM, 0.92,
+          ] as any
+        : [
+            'interpolate', ['linear'], ['zoom'],
+            CIRCLE_ZOOM_OPACITY_START, 0,
+            CIRCLE_ZOOM_OPACITY_START+.1, 0.75,
+            CIRCLE_ZOOM_OPACITY_MID, 0.92,
+            CIRCLE_ZOOM_OPACITY_END - .1, .75,
+            CIRCLE_ZOOM_OPACITY_END, 0,
+          ],
       'circle-pitch-alignment': 'map',
       'circle-pitch-scale': 'map',
       'circle-stroke-width': 0.65,
@@ -818,50 +830,51 @@ function addTreeLayers() {
     },
   })
 
-  // Layer 3: Tree icons at close zoom
-  mapInstance.addLayer({
-    id: 'trees-icon',
-    type: 'symbol',
-    source: 'trees',
-    'source-layer': 'trees',
-    minzoom: ICON_ZOOM_MIN,
-    layout: {
-      'icon-image': buildIconExpression(),
-      'icon-size': [
-        ...buildIconSizeExpression(),
-      ],
-      'icon-rotate': ['get', 'rotation'],
-      'icon-rotation-alignment': 'viewport',
-      'icon-pitch-alignment': 'viewport',
-      'icon-allow-overlap': true,
-      'icon-ignore-placement': true,
-    },
-    paint: {
-      'icon-opacity': [
-        'interpolate', ['linear'], ['zoom'],
-        ICON_ZOOM_OPACITY_START, 0,
-        ICON_ZOOM_OPACITY_MID, 0.72,
-        ICON_ZOOM_OPACITY_END, 1,
-      ],
-    },
-  })
+  // Layer 3: Tree icons at close zoom (skipped in simplified mode)
+  if (!props.simplified) {
+    mapInstance.addLayer({
+      id: 'trees-icon',
+      type: 'symbol',
+      source: 'trees',
+      'source-layer': 'trees',
+      minzoom: ICON_ZOOM_MIN,
+      layout: {
+        'icon-image': buildIconExpression(),
+        'icon-size': [
+          ...buildIconSizeExpression(),
+        ],
+        'icon-rotate': ['get', 'rotation'],
+        'icon-rotation-alignment': 'viewport',
+        'icon-pitch-alignment': 'viewport',
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      },
+      paint: {
+        'icon-opacity': [
+          'interpolate', ['linear'], ['zoom'],
+          ICON_ZOOM_OPACITY_START, 0,
+          ICON_ZOOM_OPACITY_MID, 0.72,
+          ICON_ZOOM_OPACITY_END, 1,
+        ],
+      },
+    })
+  }
 
   if (!treeInteractionsBound) {
-    // Single click handler for both tree layers to avoid duplicate popups when
-    // icon + circle overlap for the same feature.
+    const interactiveLayers = props.simplified ? ['trees-circle'] : ['trees-icon', 'trees-circle']
+
     map.on('click', (e) => {
       if (!map) return
-      const features = map.queryRenderedFeatures(e.point, { layers: ['trees-icon', 'trees-circle'] })
+      const features = map.queryRenderedFeatures(e.point, { layers: interactiveLayers })
       if (!features.length) return
 
-      const iconFeature = features.find((f) => f.layer?.id === 'trees-icon')
+      const iconFeature = !props.simplified ? features.find((f) => f.layer?.id === 'trees-icon') : undefined
       const picked = (iconFeature ?? features[0]) as unknown as GeoJSON.Feature
       const offset = (iconFeature ?? features[0]).layer?.id === 'trees-icon' ? 15 : 8
       void showTreePopup(picked, offset)
     })
 
-    // Cursor style
-    for (const layer of ['trees-icon', 'trees-circle']) {
+    for (const layer of interactiveLayers) {
       map.on('mouseenter', layer, () => { map!.getCanvas().style.cursor = 'pointer' })
       map.on('mouseleave', layer, () => { map!.getCanvas().style.cursor = '' })
     }
@@ -1002,16 +1015,18 @@ onMounted(() => {
     container: mapContainer.value!,
     // Dark vector basemap (keeps vector rendering while matching prior dark theme).
     style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
-    zoom: INTRO_START_ZOOM,
+    zoom: props.simplified ? 13 : INTRO_START_ZOOM,
     center: INTRO_CENTER,
-    pitch: 60,
-    bearing: -20,
-    maxPitch: 70,
+    pitch: props.simplified ? 0 : 60,
+    bearing: props.simplified ? 0 : -20,
+    maxPitch: props.simplified ? 0 : 70,
     maxZoom: MAX_ZOOM,
     keyboard: true,
   })
 
-  setMapInteractions(false)
+  if (!props.simplified) {
+    setMapInteractions(false)
+  }
 
   // Reduce scroll zoom sensitivity for smoother manual zooming.
   try {
@@ -1029,12 +1044,14 @@ onMounted(() => {
   map.on('load', () => {
     console.info('[Perf] map:style:load', { ms: Math.round(nowMs() - mapInitStartedAt) })
     updateZoomLevel()
-    try {
-      registerTreeIcons(map!, categoryIcons.value)
-    } catch (e) {
-      console.warn('[TreeIcons] registration failed during map load', e)
+    if (!props.simplified) {
+      try {
+        registerTreeIcons(map!, categoryIcons.value)
+      } catch (e) {
+        console.warn('[TreeIcons] registration failed during map load', e)
+      }
+      console.info('[Perf] map:icons:registered', { ms: Math.round(nowMs() - mapInitStartedAt) })
     }
-    console.info('[Perf] map:icons:registered', { ms: Math.round(nowMs() - mapInitStartedAt) })
 
     map!.on('sourcedata', (e) => {
       if (!mapQueryChangedAt) return
@@ -1061,7 +1078,9 @@ onMounted(() => {
           })
         }
 
-        runIntroZoomOut()
+        if (!props.simplified) {
+          runIntroZoomOut()
+        }
       }
       if (e.sourceId === 'carto-dark' && e.isSourceLoaded) {
         console.info('[Perf] map:basemap-source:loaded', {
@@ -1070,16 +1089,18 @@ onMounted(() => {
       }
     })
 
-    map!.on('styleimagemissing', (e) => {
-      logIconLayerDebug('style-image-missing', { id: e.id })
-      if (e.id.startsWith('tree-')) {
-        try {
-          registerTreeIcons(map!, categoryIcons.value)
-        } catch (err) {
-          console.warn('[TreeIcons] recovery registration failed', err)
+    if (!props.simplified) {
+      map!.on('styleimagemissing', (e) => {
+        logIconLayerDebug('style-image-missing', { id: e.id })
+        if (e.id.startsWith('tree-')) {
+          try {
+            registerTreeIcons(map!, categoryIcons.value)
+          } catch (err) {
+            console.warn('[TreeIcons] recovery registration failed', err)
+          }
         }
-      }
-    })
+      })
+    }
 
     map!.on('moveend', () => {
       logIconLayerSnapshot('moveend')
@@ -1104,14 +1125,16 @@ onMounted(() => {
   })
 })
 
-watch(categoryIcons, (icons) => {
-  if (!map?.loaded()) return
-  try {
-    registerTreeIcons(map, icons)
-  } catch (e) {
-    console.warn('[TreeIcons] registration failed after category icon update', e)
-  }
-})
+if (!props.simplified) {
+  watch(categoryIcons, (icons) => {
+    if (!map?.loaded()) return
+    try {
+      registerTreeIcons(map, icons)
+    } catch (e) {
+      console.warn('[TreeIcons] registration failed after category icon update', e)
+    }
+  })
+}
 
 // If data loads after map is ready
 watch([currentMapQuery, publishedTreeIdFilterSql, mapQueryRevision], async ([query, filterSql]) => {
@@ -1149,6 +1172,18 @@ watch(flyToTarget, (t) => {
     pendingSwoopFlyTimeout = null
   }
   map.stop()
+
+  if (props.simplified) {
+    // Simple direct fly for mobile/simplified mode
+    map.flyTo({
+      center: [t.lng, t.lat],
+      zoom: t.zoom ?? 16,
+      pitch: 0,
+      duration: 1500,
+      essential: true,
+    })
+    return
+  }
 
   const center = map.getCenter()
   const targetBearing = bearingTo([center.lng, center.lat], [t.lng, t.lat])
