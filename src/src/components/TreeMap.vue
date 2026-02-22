@@ -622,10 +622,14 @@ function buildIconSizeExpression(): maplibregl.ExpressionSpecification {
 function formatPopupHtml(row: any, enrichment?: ReturnType<typeof getSpeciesEnrichment>): string {
   const planted = row.plant_date?.split(' ')[0] ?? null
   const evergreen = enrichment?.is_evergreen == null ? null : (enrichment.is_evergreen ? 'Yes' : 'No')
+  const category = enrichment?.tree_category
+    ? enrichment.tree_category.charAt(0).toUpperCase() + enrichment.tree_category.slice(1)
+    : null
   const detailLines = [
     ['ID', row.tree_id],
+    ['Category', category],
     ['Planted', planted],
-    ['DBH', row.diameter_at_breast_height != null ? `${row.diameter_at_breast_height}\"` : null],
+    ['Trunk diameter', row.diameter_at_breast_height != null ? `${row.diameter_at_breast_height}"` : null],
     ['Site', row.site_info],
     ['Native', enrichment?.native_status],
     ['Evergreen', evergreen],

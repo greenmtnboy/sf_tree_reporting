@@ -266,6 +266,9 @@ function handleLandmarkClick(lm: Landmark) {
   min-width: 0 !important;
   border-left: none !important;
   flex: 1;
+  height: auto !important;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .mobile-chat-overlay .chat-header {

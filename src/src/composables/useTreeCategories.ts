@@ -72,7 +72,7 @@ function drawTreeIcon(category: TreeCategory, size: number): HTMLCanvasElement {
   const ctx = canvas.getContext('2d')!
   const color = CATEGORY_COLORS[category]
   const cx = size / 2
-  const bottom = size - 2
+  const _bottom = size - 2
 
   ctx.fillStyle = '#5D4037'
   ctx.strokeStyle = 'none'
