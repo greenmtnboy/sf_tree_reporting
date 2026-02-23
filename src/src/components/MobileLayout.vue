@@ -18,6 +18,14 @@
         </svg>
         Text
       </button>
+      <button class="mobile-bar-btn" @click="openPanel('info')">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="16" x2="12" y2="12" />
+          <line x1="12" y1="8" x2="12.01" y2="8" />
+        </svg>
+        Info
+      </button>
     </div>
 
     <transition name="mobile-slide">
@@ -59,6 +67,18 @@
         <ChatPanel />
       </div>
     </transition>
+
+    <transition name="mobile-slide">
+      <div v-if="activePanel === 'info'" class="mobile-overlay">
+        <div class="mobile-overlay-header">
+          <span class="mobile-overlay-title">About</span>
+          <button class="mobile-overlay-close" @click="activePanel = null">&times;</button>
+        </div>
+        <div class="mobile-overlay-body mobile-info-body">
+          <InfoView />
+        </div>
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -66,11 +86,12 @@
 import { ref, computed } from 'vue'
 import TreeMap from './TreeMap.vue'
 import ChatPanel from './ChatPanel.vue'
+import InfoView from '../views/InfoView.vue'
 import { useLandmarkData } from '../composables/useLandmarkData'
 import { useFlyTo } from '../composables/useFlyTo'
 import type { Landmark } from '../types'
 
-const activePanel = ref<'search' | 'chat' | null>(null)
+const activePanel = ref<'search' | 'chat' | 'info' | null>(null)
 const search = ref('')
 
 const { landmarks, loading: landmarkLoading } = useLandmarkData()
@@ -82,7 +103,7 @@ const filtered = computed(() => {
   return landmarks.value.filter((l) => l.name.toLowerCase().includes(q))
 })
 
-function openPanel(panel: 'search' | 'chat') {
+function openPanel(panel: 'search' | 'chat' | 'info') {
   activePanel.value = panel
 }
 
@@ -245,6 +266,12 @@ function handleLandmarkClick(lm: Landmark) {
   color: #555577;
   font-style: italic;
   text-align: center;
+}
+
+/* Info overlay body */
+.mobile-info-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Slide transition */

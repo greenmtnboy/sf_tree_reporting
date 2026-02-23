@@ -9,6 +9,10 @@
         <span class="nav-icon">&#x1f5fa;</span>
         Map
       </router-link>
+      <router-link to="/info">
+        <span class="nav-icon">&#x2139;</span>
+        Info
+      </router-link>
     </nav>
     <div class="sidebar-landmarks">
       <div class="landmarks-header">Landmarks</div>
