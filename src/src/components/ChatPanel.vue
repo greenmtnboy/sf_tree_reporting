@@ -300,4 +300,14 @@ watch(
   cursor: pointer;
   font-size: 0.85rem;
 }
+
+/* Prevent iOS auto-zoom on input focus (requires font-size >= 16px) */
+@media screen and (max-width: 768px) {
+  .chat-input-area input {
+    font-size: 16px;
+  }
+  .chat-api-key input {
+    font-size: 16px;
+  }
+}
 </style>
