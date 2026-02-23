@@ -598,18 +598,7 @@ function buildSqrtDbhExpression(minValue: number, maxValue: number): maplibregl.
   ] as maplibregl.ExpressionSpecification
 }
 
-function buildCircleRadiusExpression(simplified?: boolean): maplibregl.ExpressionSpecification {
-  // In simplified (mobile) mode, circles are the only high-zoom visualization
-  // (no icon layer), so boost their size to stay visible against the dark basemap.
-  if (simplified) {
-    return [
-      'interpolate', ['linear'], ['zoom'],
-      CIRCLE_ZOOM_MIN, buildSqrtDbhExpression(0.65, 1),
-      CIRCLE_ZOOM_RADIUS_MID, buildSqrtDbhExpression(3.5, 8),
-      CIRCLE_ZOOM_RADIUS_HIGH, buildSqrtDbhExpression(5.5, 15),
-      CIRCLE_ZOOM_RADIUS_MAX, buildSqrtDbhExpression(6.5, 17),
-    ] as maplibregl.ExpressionSpecification
-  }
+function buildCircleRadiusExpression(): maplibregl.ExpressionSpecification {
   return [
     'interpolate', ['linear'], ['zoom'],
     CIRCLE_ZOOM_MIN, buildSqrtDbhExpression(0.65, 1),
@@ -820,7 +809,7 @@ function addTreeLayers() {
     ...(props.simplified ? {} : { maxzoom: CIRCLE_ZOOM_MAX }),
     paint: {
       'circle-radius': [
-        ...buildCircleRadiusExpression(props.simplified),
+        ...buildCircleRadiusExpression(),
       ],
       'circle-color': buildColorExpression(),
       'circle-opacity': props.simplified
@@ -840,17 +829,8 @@ function addTreeLayers() {
           ],
       'circle-pitch-alignment': 'map',
       'circle-pitch-scale': 'map',
-      'circle-stroke-width': props.simplified
-        ? [
-            'interpolate', ['linear'], ['zoom'],
-            CIRCLE_ZOOM_MIN, 0.65,
-            CIRCLE_ZOOM_RADIUS_MID, 1.2,
-            MAX_ZOOM, 1.5,
-          ] as any
-        : 0.65,
-      'circle-stroke-color': props.simplified
-        ? 'rgba(255,255,255,0.45)'
-        : 'rgba(255,255,255,0)',
+      'circle-stroke-width': 0.65,
+      'circle-stroke-color': 'rgba(255,255,255,0)',
     },
   })
 
