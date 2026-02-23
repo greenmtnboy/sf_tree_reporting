@@ -29,7 +29,7 @@
         <div class="chat-msg-content">
           <div v-if="msg.isLoading" class="chat-loading">Thinking...</div>
           <template v-else>
-            <div v-if="msg.content" v-html="renderMarkdown(msg.content)"></div>
+            <MarkdownRenderer v-if="msg.content" :markdown="msg.content" />
             <div v-if="msg.toolCalls?.length" class="chat-tool-calls">
               <div v-for="tc in msg.toolCalls" :key="tc.id" class="chat-tool-call">
                 <span class="tool-name">{{ tc.name }}</span>
@@ -57,6 +57,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch } from 'vue'
+import { MarkdownRenderer } from '@trilogy-data/trilogy-studio-components'
 import { useChat } from '../composables/useChat'
 
 const { messages, isLoading, hasApiKey, setApiKey, sendMessage, clearMessages } = useChat()
@@ -77,18 +78,6 @@ async function handleSend() {
   if (!text || isLoading.value) return
   userInput.value = ''
   await sendMessage(text)
-}
-
-function renderMarkdown(text: string): string {
-  if (!text) return ''
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\n/g, '<br>')
 }
 
 async function scrollToBottom() {
