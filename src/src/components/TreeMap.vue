@@ -578,7 +578,8 @@ function buildHeatmapColorExpression(category: TreeCategory): maplibregl.Express
     ['linear'],
     ['heatmap-density'],
     0, 'rgba(0,0,0,0)',
-    0.2, 'rgba(0,0,0,0)',
+    0.05, 'rgba(0,0,0,0)',
+    0.15, color,
     0.55, color,
     1, color,
   ] as maplibregl.ExpressionSpecification
