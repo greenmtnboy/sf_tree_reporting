@@ -1,382 +1,176 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Office Layout Generator — 12'7" × 8'5"</title>
   <style>
-    /* ------------------------------------------------------------------ */
-    /* Base                                                                */
-    /* ------------------------------------------------------------------ */
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    :root {
-      --bg:       #f5f0eb;
-      --surface:  #ffffff;
-      --accent:   #7c6853;
-      --accent-l: #a89279;
-      --text:     #3a3028;
-      --text-m:   #6b5e50;
-      --border:   #ddd3c8;
-      --radius:   12px;
-      --shadow:   0 2px 12px rgba(0,0,0,.08);
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#f5f0eb;--surface:#fff;--accent:#7c6853;--accent-l:#a89279;
+      --text:#3a3028;--text-m:#6b5e50;--border:#ddd3c8;--radius:12px;
+      --shadow:0 2px 12px rgba(0,0,0,.08);
     }
-    body {
-      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.6;
-      min-height: 100vh;
-    }
-    a { color: var(--accent); }
+    body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh}
+    a{color:var(--accent)}
 
-    /* ------------------------------------------------------------------ */
-    /* Header                                                              */
-    /* ------------------------------------------------------------------ */
-    header {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
-      padding: 1.5rem 2rem;
-      text-align: center;
-    }
-    header h1 {
-      font-size: 1.6rem;
-      font-weight: 700;
-      color: var(--accent);
-    }
-    header p { color: var(--text-m); font-size: .95rem; margin-top: .25rem; }
+    /* Header */
+    header{background:var(--surface);border-bottom:1px solid var(--border);padding:1.5rem 2rem;text-align:center}
+    header h1{font-size:1.6rem;font-weight:700;color:var(--accent)}
+    header p{color:var(--text-m);font-size:.95rem;margin-top:.25rem}
+    .room-info{display:flex;justify-content:center;gap:2rem;margin-top:.75rem;font-size:.85rem;color:var(--text-m);flex-wrap:wrap}
+    .room-info span::before{content:'•';margin-right:.4rem;color:var(--accent-l)}
 
-    /* room info bar */
-    .room-info {
-      display: flex;
-      justify-content: center;
-      gap: 2rem;
-      margin-top: .75rem;
-      font-size: .85rem;
-      color: var(--text-m);
-    }
-    .room-info span::before {
-      content: '•';
-      margin-right: .4rem;
-      color: var(--accent-l);
-    }
+    .container{max-width:1280px;margin:0 auto;padding:2rem 1.5rem}
+    .section-title{font-size:1.15rem;font-weight:600;margin-bottom:1rem;color:var(--accent)}
 
-    /* ------------------------------------------------------------------ */
-    /* Main layout                                                         */
-    /* ------------------------------------------------------------------ */
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 2rem 1.5rem;
-    }
+    /* Layout grid */
+    .layout-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;margin-bottom:2rem}
+    .layout-card{background:var(--surface);border:2px solid var(--border);border-radius:var(--radius);padding:.75rem;cursor:pointer;transition:border-color .2s,box-shadow .2s}
+    .layout-card:hover{border-color:var(--accent-l);box-shadow:var(--shadow)}
+    .layout-card.selected{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,104,83,.18)}
+    .layout-card h3{font-size:.92rem;margin-bottom:.15rem}
+    .layout-card .tagline{font-size:.78rem;color:var(--text-m);margin-bottom:.5rem}
+    .layout-card .mini-plan{width:100%;aspect-ratio:151/101;background:#fdf9f5;border-radius:6px;overflow:hidden}
 
-    /* ------------------------------------------------------------------ */
-    /* Layout selector cards                                               */
-    /* ------------------------------------------------------------------ */
-    .section-title {
-      font-size: 1.15rem;
-      font-weight: 600;
-      margin-bottom: 1rem;
-      color: var(--accent);
-    }
-    .layout-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-      gap: 1rem;
-      margin-bottom: 2rem;
-    }
-    .layout-card {
-      background: var(--surface);
-      border: 2px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.1rem;
-      cursor: pointer;
-      transition: border-color .2s, box-shadow .2s;
-    }
-    .layout-card:hover { border-color: var(--accent-l); box-shadow: var(--shadow); }
-    .layout-card.selected { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,104,83,.18); }
-    .layout-card h3 { font-size: 1rem; margin-bottom: .2rem; }
-    .layout-card .tagline { font-size: .82rem; color: var(--text-m); }
+    /* Detail panel */
+    .detail-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1.5rem;display:none}
+    .detail-panel.visible{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+    .detail-left h3{font-size:1.1rem;color:var(--accent);margin-bottom:.5rem}
+    .detail-left p{font-size:.88rem;color:var(--text-m);margin-bottom:.75rem}
+    .storage-list{list-style:none;padding:0;font-size:.82rem}
+    .storage-list li{padding:.2rem 0;color:var(--text-m)}
+    .storage-list li::before{content:'📦 ';font-size:.75rem}
+    .detail-right{display:flex;align-items:center;justify-content:center}
+    .detail-plan{width:100%;max-width:460px}
 
-    /* ------------------------------------------------------------------ */
-    /* Description panel                                                   */
-    /* ------------------------------------------------------------------ */
-    .detail-panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.25rem 1.5rem;
-      margin-bottom: 1.5rem;
-      display: none;
-    }
-    .detail-panel.visible { display: block; }
-    .detail-panel h3 { font-size: 1.05rem; color: var(--accent); margin-bottom: .5rem; }
-    .detail-panel p { font-size: .9rem; color: var(--text-m); }
-    .placement-list { margin-top: .75rem; font-size: .85rem; }
-    .placement-list dt { font-weight: 600; display: inline; }
-    .placement-list dd { display: inline; margin-left: .25rem; color: var(--text-m); }
-    .placement-list dd::after { content: ''; display: block; margin-bottom: .25rem; }
+    /* Perspectives */
+    .persp-section{margin-bottom:1.5rem}
+    .persp-grid{display:flex;gap:.75rem;flex-wrap:wrap}
+    .persp-chip{display:inline-flex;align-items:center;gap:.35rem;padding:.45rem .9rem;border:2px solid var(--border);border-radius:20px;font-size:.82rem;cursor:pointer;background:var(--surface);transition:all .2s;user-select:none}
+    .persp-chip:hover{border-color:var(--accent-l)}
+    .persp-chip.active{border-color:var(--accent);background:rgba(124,104,83,.08);font-weight:600}
+    .persp-chip input{display:none}
 
-    /* ------------------------------------------------------------------ */
-    /* Action bar                                                          */
-    /* ------------------------------------------------------------------ */
-    .action-bar {
-      display: flex;
-      align-items: flex-end;
-      gap: 1rem;
-      margin-bottom: 2rem;
-      flex-wrap: wrap;
-    }
-    .feedback-box {
-      flex: 1;
-      min-width: 240px;
-    }
-    .feedback-box label {
-      display: block;
-      font-size: .85rem;
-      font-weight: 500;
-      margin-bottom: .35rem;
-      color: var(--text-m);
-    }
-    .feedback-box textarea {
-      width: 100%;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: .6rem .75rem;
-      font-size: .9rem;
-      resize: vertical;
-      min-height: 60px;
-      font-family: inherit;
-    }
-    .feedback-box textarea:focus { outline: none; border-color: var(--accent); }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: .4rem;
-      padding: .7rem 1.5rem;
-      border: none;
-      border-radius: 8px;
-      font-size: .95rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background .2s;
-    }
-    .btn-primary {
-      background: var(--accent);
-      color: #fff;
-    }
-    .btn-primary:hover { background: var(--accent-l); }
-    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
-    .btn-outline {
-      background: transparent;
-      border: 2px solid var(--accent);
-      color: var(--accent);
-    }
-    .btn-outline:hover { background: rgba(124,104,83,.07); }
+    /* Action bar */
+    .action-bar{display:flex;align-items:flex-end;gap:1rem;margin-bottom:2rem;flex-wrap:wrap}
+    .feedback-box{flex:1;min-width:240px}
+    .feedback-box label{display:block;font-size:.85rem;font-weight:500;margin-bottom:.35rem;color:var(--text-m)}
+    .feedback-box textarea{width:100%;border:1px solid var(--border);border-radius:8px;padding:.6rem .75rem;font-size:.9rem;resize:vertical;min-height:60px;font-family:inherit}
+    .feedback-box textarea:focus{outline:none;border-color:var(--accent)}
+    .btn{display:inline-flex;align-items:center;gap:.4rem;padding:.65rem 1.3rem;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;transition:background .2s}
+    .btn-primary{background:var(--accent);color:#fff}
+    .btn-primary:hover{background:var(--accent-l)}
+    .btn-primary:disabled{opacity:.5;cursor:not-allowed}
+    .btn-outline{background:transparent;border:2px solid var(--accent);color:var(--accent);padding:.5rem 1rem;font-size:.82rem;border-radius:6px}
+    .btn-outline:hover{background:rgba(124,104,83,.07)}
+    .btn-group{display:flex;gap:.5rem;flex-wrap:wrap}
 
-    /* ------------------------------------------------------------------ */
-    /* Results gallery                                                     */
-    /* ------------------------------------------------------------------ */
-    .results-title {
-      font-size: 1.15rem;
-      font-weight: 600;
-      margin-bottom: 1rem;
-      color: var(--accent);
-    }
-    .results-empty {
-      text-align: center;
-      padding: 3rem 1rem;
-      color: var(--text-m);
-      font-size: .95rem;
-    }
-    .result-list {
-      display: flex;
-      flex-direction: column;
-      gap: 1.5rem;
-    }
-    .result-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-      box-shadow: var(--shadow);
-    }
-    .result-card img {
-      width: 100%;
-      display: block;
-      max-height: 480px;
-      object-fit: contain;
-      background: #e8e0d8;
-    }
-    .result-meta {
-      padding: 1rem 1.25rem;
-    }
-    .result-meta h4 { font-size: 1rem; margin-bottom: .35rem; }
-    .result-meta .model-tag {
-      display: inline-block;
-      background: #ece6df;
-      color: var(--accent);
-      font-size: .75rem;
-      padding: .15rem .5rem;
-      border-radius: 4px;
-      margin-bottom: .5rem;
-    }
-    .result-meta .feedback-used {
-      font-size: .82rem;
-      color: var(--text-m);
-      font-style: italic;
-      margin-bottom: .5rem;
-    }
-    /* Grade bar */
-    .grade-section { margin-top: .5rem; }
-    .grade-section summary {
-      cursor: pointer;
-      font-size: .9rem;
-      font-weight: 600;
-      color: var(--accent);
-    }
-    .grade-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-      gap: .5rem;
-      margin-top: .5rem;
-    }
-    .grade-item {
-      display: flex;
-      justify-content: space-between;
-      font-size: .82rem;
-      padding: .25rem .5rem;
-      background: #f8f4f0;
-      border-radius: 4px;
-    }
-    .grade-item .label { color: var(--text-m); }
-    .grade-item .score { font-weight: 700; color: var(--accent); }
-    .grade-feedback {
-      margin-top: .5rem;
-      font-size: .85rem;
-      color: var(--text-m);
-      padding: .5rem .75rem;
-      background: #fdf9f5;
-      border-left: 3px solid var(--accent-l);
-      border-radius: 4px;
-    }
-    .overall-badge {
-      display: inline-block;
-      background: var(--accent);
-      color: #fff;
-      font-size: .85rem;
-      font-weight: 700;
-      padding: .2rem .65rem;
-      border-radius: 6px;
-      margin-left: .5rem;
-    }
+    /* Results */
+    .results-title{font-size:1.15rem;font-weight:600;margin-bottom:1rem;color:var(--accent)}
+    .results-empty{text-align:center;padding:3rem 1rem;color:var(--text-m);font-size:.95rem}
+    .result-list{display:flex;flex-direction:column;gap:1.5rem}
+    .result-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
+    .result-card img{width:100%;display:block;max-height:520px;object-fit:contain;background:#e8e0d8}
+    .result-meta{padding:1rem 1.25rem}
+    .result-meta h4{font-size:1rem;margin-bottom:.35rem}
+    .tag{display:inline-block;font-size:.72rem;padding:.12rem .45rem;border-radius:4px;margin-right:.35rem;margin-bottom:.35rem}
+    .tag-model{background:#ece6df;color:var(--accent)}
+    .tag-persp{background:#dfe8ec;color:#4a6e7f}
+    .result-meta .feedback-used{font-size:.82rem;color:var(--text-m);font-style:italic;margin-bottom:.5rem}
+    .grade-section{margin-top:.5rem}
+    .grade-section summary{cursor:pointer;font-size:.9rem;font-weight:600;color:var(--accent)}
+    .grade-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.4rem;margin-top:.5rem}
+    .grade-item{display:flex;justify-content:space-between;font-size:.8rem;padding:.2rem .45rem;background:#f8f4f0;border-radius:4px}
+    .grade-item .label{color:var(--text-m)}.grade-item .score{font-weight:700;color:var(--accent)}
+    .grade-feedback{margin-top:.5rem;font-size:.85rem;color:var(--text-m);padding:.5rem .75rem;background:#fdf9f5;border-left:3px solid var(--accent-l);border-radius:4px}
+    .overall-badge{display:inline-block;background:var(--accent);color:#fff;font-size:.82rem;font-weight:700;padding:.15rem .55rem;border-radius:6px;margin-left:.4rem}
 
-    /* ------------------------------------------------------------------ */
-    /* Spinner                                                             */
-    /* ------------------------------------------------------------------ */
-    .spinner-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(245,240,235,.85);
-      z-index: 100;
-      align-items: center;
-      justify-content: center;
-      flex-direction: column;
-      gap: 1rem;
-    }
-    .spinner-overlay.active { display: flex; }
-    .spinner {
-      width: 48px; height: 48px;
-      border: 4px solid var(--border);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .spinner-text { font-size: 1rem; color: var(--text-m); }
+    /* Spinner */
+    .spinner-overlay{display:none;position:fixed;inset:0;background:rgba(245,240,235,.88);z-index:100;align-items:center;justify-content:center;flex-direction:column;gap:1rem}
+    .spinner-overlay.active{display:flex}
+    .spinner{width:48px;height:48px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .spinner-text{font-size:1rem;color:var(--text-m);text-align:center;max-width:300px}
+    .spinner-progress{font-size:.85rem;color:var(--accent);font-weight:600}
 
-    /* ------------------------------------------------------------------ */
-    /* Floor plan mini-diagram                                             */
-    /* ------------------------------------------------------------------ */
-    .floor-plan-mini {
-      margin: 1rem auto 1.5rem;
-      max-width: 320px;
-    }
-    .floor-plan-mini svg {
-      width: 100%;
-      height: auto;
-    }
+    /* SVG diagram colours */
+    .fp-room{fill:#fdf9f5;stroke:#7c6853;stroke-width:1.5}
+    .fp-window{stroke:#5ba3d9;stroke-width:4;stroke-linecap:round}
+    .fp-door{fill:#b07a4a}
+    .fp-door-arc{fill:none;stroke:#b07a4a;stroke-width:.8;stroke-dasharray:3,2}
+    .fp-label{font-size:5.5px;fill:#3a3028;font-family:system-ui,sans-serif;pointer-events:none}
+    .fp-dim{font-size:5px;fill:#999;font-family:system-ui,sans-serif}
+    .fp-furniture-desk{fill:#c49a6c;stroke:#9e7a4e;stroke-width:.6;rx:1}
+    .fp-furniture-chair{fill:#999;stroke:#777;stroke-width:.6;rx:10}
+    .fp-furniture-sofa{fill:#7daa9d;stroke:#5c8a7d;stroke-width:.6;rx:2}
+    .fp-furniture-storage{fill:#d4a574;stroke:#b8874e;stroke-width:.6;rx:1}
+    .fp-furniture-shelf{fill:#c9a87c;stroke:#a8874e;stroke-width:.6;rx:.5}
 
-    /* Responsive */
-    @media (max-width: 640px) {
-      .action-bar { flex-direction: column; }
-      header h1 { font-size: 1.3rem; }
-      .room-info { flex-direction: column; gap: .3rem; }
+    @media(max-width:768px){
+      .detail-panel.visible{grid-template-columns:1fr}
+      .layout-grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+    }
+    @media(max-width:480px){
+      .action-bar{flex-direction:column}
+      header h1{font-size:1.2rem}
+      .room-info{flex-direction:column;gap:.3rem}
     }
   </style>
 </head>
 <body>
-  <!-- Header -->
   <header>
     <h1>Office Layout Generator</h1>
-    <p>Design a cozy dual-purpose office &amp; guest room</p>
+    <p>20 layouts for a cozy dual-purpose office &amp; guest room</p>
     <div class="room-info">
       <span>12'7" &times; 8'5"</span>
       <span>Window on long wall</span>
       <span>Door opposite</span>
-      <span>Desk + Chair + Sleeper Sofa</span>
+      <span>Desk + Chair + Sleeper Sofa + Storage</span>
     </div>
   </header>
 
-  <!-- Floor plan reference -->
   <div class="container">
-    <div class="floor-plan-mini">
-      <svg viewBox="0 0 320 210" xmlns="http://www.w3.org/2000/svg">
-        <!-- Room outline -->
-        <rect x="10" y="10" width="300" height="190" rx="2" fill="#fdf9f5" stroke="#7c6853" stroke-width="2"/>
-        <!-- Window (top long wall) -->
-        <line x1="110" y1="10" x2="210" y2="10" stroke="#5ba3d9" stroke-width="5"/>
-        <text x="160" y="5" text-anchor="middle" font-size="10" fill="#5ba3d9">window</text>
-        <!-- Door (bottom long wall) -->
-        <rect x="55" y="195" width="30" height="5" fill="#b07a4a"/>
-        <!-- Door swing arc -->
-        <path d="M 85 200 A 30 30 0 0 1 55 170" fill="none" stroke="#b07a4a" stroke-width="1" stroke-dasharray="3,2"/>
-        <text x="70" y="212" text-anchor="middle" font-size="10" fill="#b07a4a">door</text>
-        <!-- Dimension labels -->
-        <text x="160" y="115" text-anchor="middle" font-size="12" fill="#999">12'7"</text>
-        <text x="335" y="105" text-anchor="middle" font-size="12" fill="#999" transform="rotate(90, 335, 105)">8'5"</text>
-        <!-- Long wall labels -->
-        <text x="5" y="105" text-anchor="middle" font-size="9" fill="#bbb" transform="rotate(-90,5,105)">8'5" (short)</text>
-      </svg>
-    </div>
-
     <!-- Layout selector -->
-    <div class="section-title">Choose a Layout</div>
+    <div class="section-title">Choose a Layout (20 options)</div>
     <div class="layout-grid" id="layoutGrid"></div>
 
     <!-- Detail panel -->
     <div class="detail-panel" id="detailPanel">
-      <h3 id="detailName"></h3>
-      <p id="detailDesc"></p>
-      <dl class="placement-list" id="detailPlacement"></dl>
+      <div class="detail-left">
+        <h3 id="detailName"></h3>
+        <p id="detailDesc"></p>
+        <div style="margin-top:.5rem;font-size:.85rem;font-weight:600;color:var(--accent)">Storage Solutions</div>
+        <ul class="storage-list" id="detailStorage"></ul>
+      </div>
+      <div class="detail-right">
+        <div class="detail-plan" id="detailPlanSvg"></div>
+      </div>
+    </div>
+
+    <!-- Perspective selector -->
+    <div class="persp-section" id="perspSection" style="display:none">
+      <div class="section-title">Camera Perspectives</div>
+      <div class="persp-grid" id="perspGrid"></div>
     </div>
 
     <!-- Action bar -->
     <div class="action-bar">
       <div class="feedback-box">
-        <label for="feedbackInput">Feedback / refinement instructions (optional)</label>
-        <textarea id="feedbackInput" placeholder="e.g. 'Make it warmer with more plants' or 'Swap the desk and sofa positions'"></textarea>
+        <label for="feedbackInput">Feedback / refinement (optional)</label>
+        <textarea id="feedbackInput" placeholder="e.g. 'Warmer tones, more plants, make the sofa sage green'"></textarea>
       </div>
-      <button class="btn btn-primary" id="generateBtn" disabled>
-        Generate Visualization
-      </button>
+      <div class="btn-group">
+        <button class="btn btn-primary" id="generateBtn" disabled>Generate Selected</button>
+        <button class="btn btn-outline" id="generateAllBtn" disabled>Generate All Perspectives</button>
+      </div>
     </div>
 
     <!-- Results -->
-    <div class="results-title">Generated Layouts</div>
+    <div class="results-title">Generated Visualizations</div>
     <div id="results">
       <div class="results-empty" id="emptyState">
-        Select a layout above and click <strong>Generate</strong> to see AI-rendered visualizations graded against the floor plan.
+        Select a layout, pick camera perspectives, and click <strong>Generate</strong> to see AI-rendered visualizations graded against the floor plan.
       </div>
     </div>
   </div>
@@ -385,110 +179,285 @@
   <div class="spinner-overlay" id="spinner">
     <div class="spinner"></div>
     <div class="spinner-text" id="spinnerText">Generating layout image...</div>
+    <div class="spinner-progress" id="spinnerProgress"></div>
   </div>
 
   <script>
-    // -------------------------------------------------------------------
+    // -----------------------------------------------------------------
     // State
-    // -------------------------------------------------------------------
+    // -----------------------------------------------------------------
     let layouts = [];
-    let selectedId = null;
+    let perspectives = [];
+    let selectedLayoutId = null;
+    let selectedPerspectives = new Set();
 
-    const grid = document.getElementById('layoutGrid');
-    const detail = document.getElementById('detailPanel');
-    const detailName = document.getElementById('detailName');
-    const detailDesc = document.getElementById('detailDesc');
-    const detailPlacement = document.getElementById('detailPlacement');
-    const feedbackInput = document.getElementById('feedbackInput');
-    const genBtn = document.getElementById('generateBtn');
-    const resultsDiv = document.getElementById('results');
-    const emptyState = document.getElementById('emptyState');
-    const spinner = document.getElementById('spinner');
-    const spinnerText = document.getElementById('spinnerText');
+    const $ = id => document.getElementById(id);
+    const grid         = $('layoutGrid');
+    const detail       = $('detailPanel');
+    const detailName   = $('detailName');
+    const detailDesc   = $('detailDesc');
+    const detailStorage= $('detailStorage');
+    const detailPlan   = $('detailPlanSvg');
+    const perspSection = $('perspSection');
+    const perspGrid    = $('perspGrid');
+    const feedbackInput= $('feedbackInput');
+    const genBtn       = $('generateBtn');
+    const genAllBtn    = $('generateAllBtn');
+    const resultsDiv   = $('results');
+    const emptyState   = $('emptyState');
+    const spinner      = $('spinner');
+    const spinnerText  = $('spinnerText');
+    const spinnerProg  = $('spinnerProgress');
 
-    // -------------------------------------------------------------------
-    // Init — fetch layouts
-    // -------------------------------------------------------------------
-    fetch('/api/layouts')
-      .then(r => r.json())
-      .then(data => {
-        layouts = data;
-        renderGrid();
-        loadHistory();
+    // -----------------------------------------------------------------
+    // Room constants (must match backend)
+    // -----------------------------------------------------------------
+    const ROOM_W = 151, ROOM_D = 101;
+    const WIN = { x: 46, w: 60 };
+    const DOOR = { x: 20, w: 30 };
+    const PAD = 18; // svg padding for labels
+
+    // Colours by furniture type
+    const TYPE_COLORS = {
+      desk:    { fill: '#c49a6c', stroke: '#9e7a4e' },
+      chair:   { fill: '#999',    stroke: '#777' },
+      sofa:    { fill: '#7daa9d', stroke: '#5c8a7d' },
+      storage: { fill: '#d4a574', stroke: '#b8874e' },
+      shelf:   { fill: '#c9a87c', stroke: '#a8874e' },
+    };
+
+    // -----------------------------------------------------------------
+    // SVG floor plan renderer
+    // -----------------------------------------------------------------
+    function renderFloorPlan(container, furniture, options = {}) {
+      const { mini = false } = options;
+      const svgNS = 'http://www.w3.org/2000/svg';
+      const vbW = ROOM_W + PAD * 2;
+      const vbH = ROOM_D + PAD * 2 + (mini ? 0 : 8);
+
+      const svg = document.createElementNS(svgNS, 'svg');
+      svg.setAttribute('viewBox', `${-PAD} ${-PAD - (mini ? 0 : 8)} ${vbW} ${vbH}`);
+      svg.setAttribute('width', '100%');
+      svg.setAttribute('height', '100%');
+      svg.style.display = 'block';
+
+      // Room outline
+      const room = rect(svgNS, 0, 0, ROOM_W, ROOM_D, '#fdf9f5', '#7c6853', 1.5, 1);
+      svg.appendChild(room);
+
+      // Window
+      const win = document.createElementNS(svgNS, 'line');
+      win.setAttribute('x1', WIN.x); win.setAttribute('y1', 0);
+      win.setAttribute('x2', WIN.x + WIN.w); win.setAttribute('y2', 0);
+      win.setAttribute('stroke', '#5ba3d9'); win.setAttribute('stroke-width', mini ? 3 : 4);
+      win.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(win);
+
+      // Door
+      const door = rect(svgNS, DOOR.x, ROOM_D - 2, DOOR.w, 2, '#b07a4a', 'none', 0, 0);
+      svg.appendChild(door);
+      // Door swing arc
+      const arc = document.createElementNS(svgNS, 'path');
+      const dx = DOOR.x + DOOR.w, dy = ROOM_D;
+      arc.setAttribute('d', `M ${dx} ${dy} A ${DOOR.w} ${DOOR.w} 0 0 1 ${DOOR.x} ${dy - DOOR.w}`);
+      arc.setAttribute('fill', 'none'); arc.setAttribute('stroke', '#b07a4a');
+      arc.setAttribute('stroke-width', .7); arc.setAttribute('stroke-dasharray', '2,1.5');
+      svg.appendChild(arc);
+
+      if (!mini) {
+        // Dimension labels
+        addText(svg, svgNS, ROOM_W / 2, -6, "12'7\"", 6, '#999', 'middle');
+        addText(svg, svgNS, ROOM_W + 6, ROOM_D / 2, "8'5\"", 6, '#999', 'start', -90);
+        addText(svg, svgNS, WIN.x + WIN.w / 2, -2, 'window', 5, '#5ba3d9', 'middle');
+        addText(svg, svgNS, DOOR.x + DOOR.w / 2, ROOM_D + 7, 'door', 5, '#b07a4a', 'middle');
+      }
+
+      // Furniture
+      furniture.forEach(f => {
+        const c = TYPE_COLORS[f.type] || TYPE_COLORS.storage;
+        const rx = f.type === 'chair' ? Math.min(f.w, f.h) / 2 : 1.5;
+        const r = rect(svgNS, f.x, f.y, f.w, f.h, c.fill, c.stroke, .6, rx);
+        r.setAttribute('opacity', '0.85');
+        svg.appendChild(r);
+
+        // Label
+        if (!mini || f.type === 'desk' || f.type === 'sofa' || f.type === 'chair') {
+          const fontSize = mini ? 4 : 5;
+          const labelText = mini ? shortLabel(f) : f.label;
+          const tx = f.x + f.w / 2;
+          const ty = f.y + f.h / 2 + fontSize / 3;
+          addText(svg, svgNS, tx, ty, labelText, fontSize, '#fff', 'middle');
+        }
       });
 
-    function renderGrid() {
+      container.innerHTML = '';
+      container.appendChild(svg);
+    }
+
+    function shortLabel(f) {
+      if (f.type === 'desk') return 'Desk';
+      if (f.type === 'chair') return 'Chair';
+      if (f.type === 'sofa') return 'Sofa';
+      return '';
+    }
+
+    function rect(ns, x, y, w, h, fill, stroke, sw, rx) {
+      const r = document.createElementNS(ns, 'rect');
+      r.setAttribute('x', x); r.setAttribute('y', y);
+      r.setAttribute('width', w); r.setAttribute('height', h);
+      r.setAttribute('fill', fill);
+      if (stroke !== 'none') { r.setAttribute('stroke', stroke); r.setAttribute('stroke-width', sw); }
+      if (rx) r.setAttribute('rx', rx);
+      return r;
+    }
+
+    function addText(svg, ns, x, y, text, size, fill, anchor, rotation) {
+      const t = document.createElementNS(ns, 'text');
+      t.setAttribute('x', x); t.setAttribute('y', y);
+      t.setAttribute('font-size', size); t.setAttribute('fill', fill);
+      t.setAttribute('text-anchor', anchor || 'middle');
+      t.setAttribute('font-family', 'system-ui, sans-serif');
+      t.style.pointerEvents = 'none';
+      if (rotation) t.setAttribute('transform', `rotate(${rotation}, ${x}, ${y})`);
+      t.textContent = text;
+      svg.appendChild(t);
+    }
+
+    // -----------------------------------------------------------------
+    // Init
+    // -----------------------------------------------------------------
+    Promise.all([
+      fetch('/api/layouts').then(r => r.json()),
+      fetch('/api/perspectives').then(r => r.json()),
+    ]).then(([l, p]) => {
+      layouts = l;
+      perspectives = p;
+      renderLayoutGrid();
+      renderPerspectives();
+      loadHistory();
+    });
+
+    // -----------------------------------------------------------------
+    // Layout grid
+    // -----------------------------------------------------------------
+    function renderLayoutGrid() {
       grid.innerHTML = '';
       layouts.forEach(l => {
         const card = document.createElement('div');
-        card.className = 'layout-card' + (l.id === selectedId ? ' selected' : '');
-        card.innerHTML = `<h3>${l.name}</h3><div class="tagline">${l.tagline}</div>`;
+        card.className = 'layout-card' + (l.id === selectedLayoutId ? ' selected' : '');
+        card.innerHTML = `<h3>${l.name}</h3><div class="tagline">${l.tagline}</div><div class="mini-plan" id="mini-${l.id}"></div>`;
         card.addEventListener('click', () => selectLayout(l.id));
         grid.appendChild(card);
+        // Render mini SVG after it's in the DOM
+        setTimeout(() => {
+          const miniDiv = document.getElementById('mini-' + l.id);
+          if (miniDiv) renderFloorPlan(miniDiv, l.furniture, { mini: true });
+        }, 0);
       });
     }
 
     function selectLayout(id) {
-      selectedId = id;
+      selectedLayoutId = id;
       genBtn.disabled = false;
-      renderGrid();
+      genAllBtn.disabled = false;
+      renderLayoutGrid();
+
       const l = layouts.find(x => x.id === id);
       detailName.textContent = l.name;
       detailDesc.textContent = l.description;
-      let placementHtml = '';
-      for (const [k, v] of Object.entries(l.furniture_placement)) {
-        placementHtml += `<dt>${k}:</dt><dd>${v}</dd>`;
-      }
-      detailPlacement.innerHTML = placementHtml;
+      detailStorage.innerHTML = (l.storage || []).map(s => `<li>${s}</li>`).join('');
+      renderFloorPlan(detailPlan, l.furniture, { mini: false });
       detail.classList.add('visible');
+      perspSection.style.display = '';
     }
 
-    // -------------------------------------------------------------------
-    // Generate
-    // -------------------------------------------------------------------
-    genBtn.addEventListener('click', generate);
-
-    async function generate() {
-      if (!selectedId) return;
-      genBtn.disabled = true;
-      spinner.classList.add('active');
-      spinnerText.textContent = 'Generating layout image with Gemini...';
-
-      try {
-        const resp = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            layout_id: selectedId,
-            feedback: feedbackInput.value,
-          }),
-        });
-
-        if (!resp.ok) {
-          const err = await resp.json();
-          throw new Error(err.error || 'Generation failed');
-        }
-
-        const entry = await resp.json();
-        prependResult(entry);
-        emptyState.style.display = 'none';
-      } catch (e) {
-        alert('Error: ' + e.message);
-      } finally {
-        spinner.classList.remove('active');
-        genBtn.disabled = false;
+    // -----------------------------------------------------------------
+    // Perspectives
+    // -----------------------------------------------------------------
+    function renderPerspectives() {
+      perspGrid.innerHTML = '';
+      // Default: first perspective selected
+      if (perspectives.length && selectedPerspectives.size === 0) {
+        selectedPerspectives.add(perspectives[0].id);
       }
+      perspectives.forEach(p => {
+        const chip = document.createElement('label');
+        chip.className = 'persp-chip' + (selectedPerspectives.has(p.id) ? ' active' : '');
+        chip.innerHTML = `<input type="checkbox" value="${p.id}" ${selectedPerspectives.has(p.id)?'checked':''}> ${p.name}`;
+        chip.querySelector('input').addEventListener('change', e => {
+          if (e.target.checked) selectedPerspectives.add(p.id);
+          else selectedPerspectives.delete(p.id);
+          renderPerspectives();
+        });
+        perspGrid.appendChild(chip);
+      });
     }
 
-    // -------------------------------------------------------------------
-    // Render a result card
-    // -------------------------------------------------------------------
-    function prependResult(entry) {
-      // Remove empty state
-      const existing = document.getElementById('emptyState');
-      if (existing) existing.style.display = 'none';
+    // -----------------------------------------------------------------
+    // Generate
+    // -----------------------------------------------------------------
+    genBtn.addEventListener('click', () => generateSelected());
+    genAllBtn.addEventListener('click', () => generateAll());
 
-      // Ensure result-list container
+    async function generateSelected() {
+      const ids = [...selectedPerspectives];
+      if (!ids.length) { alert('Select at least one camera perspective.'); return; }
+      await generateMultiple(ids);
+    }
+
+    async function generateAll() {
+      const ids = perspectives.map(p => p.id);
+      await generateMultiple(ids);
+    }
+
+    async function generateMultiple(perspIds) {
+      if (!selectedLayoutId) return;
+      genBtn.disabled = true;
+      genAllBtn.disabled = true;
+      spinner.classList.add('active');
+
+      const total = perspIds.length;
+      let done = 0;
+
+      for (const pid of perspIds) {
+        const pName = perspectives.find(p => p.id === pid)?.name || pid;
+        spinnerText.textContent = `Generating: ${pName}...`;
+        spinnerProg.textContent = `${done + 1} / ${total}`;
+
+        try {
+          const resp = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              layout_id: selectedLayoutId,
+              perspective_id: pid,
+              feedback: feedbackInput.value,
+            }),
+          });
+          if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.error || 'Generation failed');
+          }
+          const entry = await resp.json();
+          prependResult(entry);
+          emptyState.style.display = 'none';
+        } catch (e) {
+          alert(`Error (${pName}): ${e.message}`);
+        }
+        done++;
+      }
+
+      spinner.classList.remove('active');
+      spinnerProg.textContent = '';
+      genBtn.disabled = false;
+      genAllBtn.disabled = false;
+    }
+
+    // -----------------------------------------------------------------
+    // Result card
+    // -----------------------------------------------------------------
+    function prependResult(entry) {
+      emptyState.style.display = 'none';
       let list = resultsDiv.querySelector('.result-list');
       if (!list) {
         list = document.createElement('div');
@@ -496,25 +465,28 @@
         resultsDiv.appendChild(list);
       }
 
-      const card = document.createElement('div');
-      card.className = 'result-card';
-
       const g = entry.grade || {};
       const overall = g.overall != null ? Number(g.overall).toFixed(1) : '—';
-      const gradeKeys = ['room_proportions','furniture_presence','furniture_placement','window_door','style_cozy','realism'];
+      const gradeKeys = [
+        'room_proportions','furniture_presence','furniture_placement',
+        'storage_presence','window_door','camera_angle','style_cozy','realism',
+      ];
 
+      const card = document.createElement('div');
+      card.className = 'result-card';
       card.innerHTML = `
-        <img src="/images/${entry.filename}" alt="${entry.layout_name}" loading="lazy"/>
+        <img src="/images/${entry.filename}" alt="${entry.layout_name} — ${entry.perspective_name}" loading="lazy"/>
         <div class="result-meta">
           <h4>${entry.layout_name}</h4>
-          <span class="model-tag">${entry.model}</span>
+          <span class="tag tag-persp">${entry.perspective_name}</span>
+          <span class="tag tag-model">${entry.model}</span>
           ${entry.feedback_used ? `<div class="feedback-used">"${entry.feedback_used}"</div>` : ''}
           <details class="grade-section">
             <summary>Quality Grade <span class="overall-badge">${overall}/10</span></summary>
             <div class="grade-grid">
               ${gradeKeys.map(k => `
                 <div class="grade-item">
-                  <span class="label">${k.replace(/_/g, ' ')}</span>
+                  <span class="label">${k.replace(/_/g,' ')}</span>
                   <span class="score">${g[k] != null ? g[k] : '—'}</span>
                 </div>
               `).join('')}
@@ -522,36 +494,30 @@
             ${g.feedback ? `<div class="grade-feedback">${g.feedback}</div>` : ''}
           </details>
           <div style="margin-top:.75rem;">
-            <button class="btn btn-outline btn-sm" onclick="regen('${entry.layout_id}', this)">
-              Regenerate with feedback
-            </button>
+            <button class="btn btn-outline" onclick="regenFrom('${entry.layout_id}')">Refine this layout</button>
           </div>
         </div>
       `;
       list.prepend(card);
     }
 
-    // Quick regen: copies layout id + prompts for feedback
-    function regen(layoutId, btn) {
+    function regenFrom(layoutId) {
       selectLayout(layoutId);
       feedbackInput.focus();
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    // -------------------------------------------------------------------
-    // Load history on page load
-    // -------------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // History
+    // -----------------------------------------------------------------
     async function loadHistory() {
       try {
-        const resp = await fetch('/api/history');
-        const data = await resp.json();
+        const data = await (await fetch('/api/history')).json();
         if (data.length) {
           emptyState.style.display = 'none';
-          data.forEach(entry => prependResult(entry));
+          data.forEach(prependResult);
         }
-      } catch (e) {
-        console.warn('Could not load history', e);
-      }
+      } catch (e) { console.warn('History load failed', e); }
     }
   </script>
 </body>
