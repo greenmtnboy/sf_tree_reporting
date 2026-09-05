@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Moved: tree_reporting</title>
+    <script>
+      (function () {
+        var baseUrl = "https://greenmtnboy.github.io";
+        var legacyPrefix = /^\/sf_tree_reporting(?=\/|$)/;
+        var pathSuffix = legacyPrefix.test(window.location.pathname)
+          ? window.location.pathname.replace(legacyPrefix, "")
+          : window.location.pathname;
+        var targetPath =
+          pathSuffix === "" || pathSuffix === "/"
+            ? "/tree_reporting/"
+            : "/tree_reporting" + (pathSuffix.startsWith("/") ? pathSuffix : "/" + pathSuffix);
+        var targetUrl = baseUrl + targetPath + window.location.search + window.location.hash;
+        window.location.replace(targetUrl);
+      })();
+    </script>
+  </head>
+  <body>
+    <p>
+      This site moved to
+      <a href="https://greenmtnboy.github.io/tree_reporting/">https://greenmtnboy.github.io/tree_reporting/</a>.
+    </p>
+    <noscript>
+      <p>Enable JavaScript for automatic redirects that preserve the requested path.</p>
+    </noscript>
+  </body>
+</html>
