@@ -10,7 +10,10 @@
         var pathSuffix = legacyPrefix.test(window.location.pathname)
           ? window.location.pathname.replace(legacyPrefix, "")
           : window.location.pathname;
-        var targetPath = "/tree_reporting" + (pathSuffix.startsWith("/") ? pathSuffix : "/" + pathSuffix);
+        var targetPath =
+          pathSuffix === "" || pathSuffix === "/"
+            ? "/tree_reporting/"
+            : "/tree_reporting" + (pathSuffix.startsWith("/") ? pathSuffix : "/" + pathSuffix);
         var targetUrl = baseUrl + targetPath + window.location.search + window.location.hash;
         window.location.replace(targetUrl);
       })();
